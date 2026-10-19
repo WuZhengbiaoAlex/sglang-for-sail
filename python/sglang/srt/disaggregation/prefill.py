@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
+    set_draft_kv_transfer_metadata,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs

@@ -35,9 +35,11 @@ from sglang.srt.disaggregation.common.staging_handler import (
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
+    build_draft_head_transfer_blocks,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -1092,6 +1094,165 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    def _skip_replicated_target_kv(self, dst_attn_tp_size: int) -> bool:
+        if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+            return False
+        if self.attn_tp_size <= dst_attn_tp_size:
+            return False
+        return (self.kv_args.engine_rank % self.attn_tp_size) % (
+            self.attn_tp_size // dst_attn_tp_size
+        ) != 0
+
+    def prepare_dcp_entry_geometry(self, info: KVArgsRegisterInfo) -> None:
+        """Validate target and draft rows independently before accepting a peer."""
+        args = self.kv_args
+        n = len(args.kv_item_lens)
+        draft = args.draft_kv_entry_count
+        if draft and getattr(self, "dcp_size", 1) != 1:
+            raise ValueError("Mixed target/draft transfer requires Prefill DCP1")
+        if not 0 <= draft <= n:
+            raise ValueError("Invalid draft entry count")
+        if info.dst_kv_item_lens is None:
+            if draft:
+                raise ValueError(
+                    "Draft transfer requires per-entry destination geometry"
+                )
+            sizes = [info.dst_kv_item_len] * len(info.dst_kv_ptrs)
+        else:
+            sizes = info.dst_kv_item_lens
+        if len(sizes) != len(info.dst_kv_ptrs) or len(args.kv_data_ptrs) != n:
+            raise ValueError("KV pointer/item length count differs")
+        if info.dst_draft_entry_count != draft:
+            raise ValueError("Source/destination draft entry counts differ")
+        page = args.page_size
+        if page <= 0 or (info.dst_page_size is not None and info.dst_page_size != page):
+            raise ValueError("Source/destination physical page sizes differ")
+        if info.dst_dcp_size <= 0 or not 0 <= info.dst_dcp_rank < info.dst_dcp_size:
+            raise ValueError("Invalid destination DCP rank")
+        if (
+            self.attn_tp_size <= 0
+            or info.dst_attn_tp_size <= 0
+            or max(self.attn_tp_size, info.dst_attn_tp_size)
+            % min(self.attn_tp_size, info.dst_attn_tp_size)
+        ):
+            raise ValueError(
+                "Source/destination attention TP sizes must divide each other"
+            )
+        if not 0 <= info.dst_tp_rank < info.dst_attn_tp_size:
+            raise ValueError("Destination attention TP rank out of range")
+        indices = resolve_dcp_dst_entry_indices(
+            args.kv_layer_ids, info.dst_kv_layer_ids, n, len(sizes)
+        )
+        if len(indices) != n or any(j >= len(sizes) for j in indices):
+            raise ValueError("Destination entries do not cover source")
+        src_tokens, dst_tokens = [], []
+        empty = np.empty(0, dtype=np.int64)
+        for i, j in enumerate(indices):
+            is_draft = i >= n - draft
+            if is_draft != (j >= len(sizes) - info.dst_draft_entry_count):
+                raise ValueError("Target/draft layer mapping crosses entry boundary")
+            dst_page = page * info.dst_dcp_size if is_draft else page
+            src_size, dst_size = args.kv_item_lens[i], sizes[j]
+            if src_size <= 0 or dst_size <= 0 or src_size % page or dst_size % dst_page:
+                raise ValueError("Invalid per-entry page geometry")
+            src_token, dst_token = src_size // page, dst_size // dst_page
+            if is_draft:
+                if info.dst_draft_total_head_num != args.draft_total_kv_head_num:
+                    raise ValueError("Source/destination draft total heads differ")
+                if args.draft_kv_head_num != max(
+                    1, args.draft_total_kv_head_num // self.attn_tp_size
+                ) or info.dst_draft_head_num != max(
+                    1, args.draft_total_kv_head_num // info.dst_attn_tp_size
+                ):
+                    raise ValueError("Draft local head count differs from TP geometry")
+                build_draft_head_transfer_blocks(
+                    DCPTokenTransferPlan(empty, empty),
+                    src_ptr=0,
+                    dst_ptr=0,
+                    src_token_bytes=src_token,
+                    dst_token_bytes=dst_token,
+                    total_heads=args.draft_total_kv_head_num,
+                    src_tp_size=self.attn_tp_size,
+                    src_tp_rank=args.engine_rank % self.attn_tp_size,
+                    dst_tp_size=info.dst_attn_tp_size,
+                    dst_tp_rank=info.dst_tp_rank,
+                )
+            elif src_token != dst_token:
+                raise ValueError("Target KV geometry differs")
+            src_tokens.append(src_token)
+            dst_tokens.append(dst_token)
+        info.dcp_token_item_lens = src_tokens
+        info.dcp_dst_token_item_lens = dst_tokens
+
+    def send_kvcache_mixed(
+        self,
+        session,
+        src_pages,
+        dst_pages,
+        *,
+        info,
+        src_page_offset,
+        decode_prefix_len,
+        num_kv_tokens,
+    ):
+        """Transfer replicated target MLA and head-sharded draft independently."""
+        if num_kv_tokens is None:
+            raise ValueError("Mixed target/draft transfer requires num_kv_tokens")
+        self._validate_envelope_kv_layout(
+            info.dst_kv_ptrs, info.dst_kv_item_len, info.dst_attn_tp_size
+        )
+        args = self.kv_args
+        plans = dict(
+            physical_page_size=args.page_size,
+            dcp_size=info.dst_dcp_size,
+            dcp_rank=info.dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        target_plan = build_dcp_token_transfer_plan(src_pages, dst_pages, **plans)
+        draft_plan = build_dcp_token_transfer_plan(
+            src_pages, dst_pages, replicate_to_virtual=True, **plans
+        )
+        indices = resolve_dcp_dst_entry_indices(
+            args.kv_layer_ids,
+            info.dst_kv_layer_ids,
+            len(args.kv_data_ptrs),
+            len(info.dst_kv_ptrs),
+        )
+        blocks = []
+        for i, j in enumerate(indices):
+            src_ptr, dst_ptr = args.kv_data_ptrs[i], info.dst_kv_ptrs[j]
+            width = info.dcp_token_item_lens[i]
+            if i >= len(indices) - args.draft_kv_entry_count:
+                blocks.extend(
+                    build_draft_head_transfer_blocks(
+                        draft_plan,
+                        src_ptr=src_ptr,
+                        dst_ptr=dst_ptr,
+                        src_token_bytes=width,
+                        dst_token_bytes=info.dcp_dst_token_item_lens[i],
+                        total_heads=args.draft_total_kv_head_num,
+                        src_tp_size=self.attn_tp_size,
+                        src_tp_rank=args.engine_rank % self.attn_tp_size,
+                        dst_tp_size=info.dst_attn_tp_size,
+                        dst_tp_rank=info.dst_tp_rank,
+                    )
+                )
+            elif not self._skip_replicated_target_kv(info.dst_attn_tp_size):
+                src_groups, dst_groups = group_concurrent_contiguous(
+                    target_plan.src_token_indices, target_plan.dst_token_indices
+                )
+                blocks.extend(
+                    (
+                        src_ptr + int(src[0]) * width,
+                        dst_ptr + int(dst[0]) * width,
+                        len(src) * width,
+                    )
+                    for src, dst in zip(src_groups, dst_groups)
+                )
+        return self._transfer_data(session, blocks) if blocks else 0
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -1595,7 +1756,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.attn_tp_size // info.dst_attn_tp_size
             )
             if sub_rank != 0:
-                skip_kv = True
+                skip_kv = not bool(self.kv_args.draft_kv_entry_count)
                 # Hybrid-MLA KV is replicated across these source ranks, but
                 # TP-sharded state needs every rank for the aggregation path.
 
@@ -2253,6 +2414,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif self.kv_args.draft_kv_entry_count and (
+                            self.is_mla_backend or self.is_hybrid_mla_backend
+                        ):
+                            ret = self.send_kvcache_mixed(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                chunked_dst_kv_indice,
+                                info=target_rank_registration_info,
+                                src_page_offset=(
+                                    (kv_chunk.index_slice.start or 0)
+                                    if is_dcp_transfer
+                                    else 0
+                                ),
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                                num_kv_tokens=kv_chunk.num_kv_tokens,
+                            )
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens

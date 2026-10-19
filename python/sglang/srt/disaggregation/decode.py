@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    set_draft_kv_transfer_metadata,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -632,8 +633,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            draft_kv_entry_count = len(draft_kv_data_ptrs)
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
+
+        draft_pool = self.draft_token_to_kv_pool
+        set_draft_kv_transfer_metadata(
+            kv_args,
+            draft_pool,
+            draft_kv_entry_count=draft_kv_entry_count,
+            tp_size=get_parallel().attn_tp_size,
+            total_head_num=(
+                get_draft_total_num_kv_heads(self.scheduler)
+                if draft_kv_entry_count
+                else None
+            ),
+        )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
