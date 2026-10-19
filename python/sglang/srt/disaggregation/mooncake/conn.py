@@ -919,6 +919,15 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_tp_size // dst_attn_tp_size
         ) != 0
 
+    def _requires_dcp_entry_geometry(self, info: KVArgsRegisterInfo) -> bool:
+        return bool(
+            info.requires_dcp_relayout
+            or (
+                self.kv_args.draft_kv_entry_count
+                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+            )
+        )
+
     def prepare_dcp_entry_geometry(self, info: KVArgsRegisterInfo) -> None:
         """Validate target and draft rows independently before accepting a peer."""
         args = self.kv_args
@@ -938,7 +947,7 @@ class MooncakeKVManager(CommonKVManager):
             sizes = info.dst_kv_item_lens
         if len(sizes) != len(info.dst_kv_ptrs) or len(args.kv_data_ptrs) != n:
             raise ValueError("KV pointer/item length count differs")
-        if info.dst_draft_entry_count != draft:
+        if draft and info.dst_draft_entry_count != draft:
             raise ValueError("Source/destination draft entry counts differ")
         page = args.page_size
         if page <= 0 or (info.dst_page_size is not None and info.dst_page_size != page):
@@ -2218,10 +2227,7 @@ class MooncakeKVManager(CommonKVManager):
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
                     )
-                    if (
-                        decode_kv_args.requires_dcp_relayout
-                        or self.kv_args.draft_kv_entry_count
-                    ):
+                    if self._requires_dcp_entry_geometry(decode_kv_args):
                         self.prepare_dcp_entry_geometry(decode_kv_args)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
@@ -2457,11 +2463,44 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        chunk_start_page = self.curr_idx
+        unfiltered_page_count = len(kv_indices)
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             return
+
+        if (
+            num_kv_tokens is not None
+            and self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and self.kv_mgr.attn_cp_size > 1
+            and not get_parallel().enable_dsa_cache_layer_split
+        ):
+            page_size = self.kv_mgr.kv_args.page_size
+            if page_size <= 0:
+                raise ValueError(f"Invalid source page size: {page_size}")
+            if not 0 <= num_kv_tokens <= unfiltered_page_count * page_size:
+                raise ValueError(
+                    "num_kv_tokens must fit in the unfiltered source pages, "
+                    f"got tokens={num_kv_tokens}, "
+                    f"capacity={unfiltered_page_count * page_size}"
+                )
+            selected_page_start = (index_slice.start or 0) - chunk_start_page
+            if not 0 <= selected_page_start <= unfiltered_page_count:
+                raise ValueError("CP-filtered page slice is outside the input chunk")
+            selected_page_end = selected_page_start + len(kv_indices)
+            if selected_page_end > unfiltered_page_count:
+                raise ValueError("CP-filtered page slice exceeds the input chunk")
+            selected_token_start = selected_page_start * page_size
+            selected_token_end = selected_page_end * page_size
+            # Intersect this sender's original page interval with the valid token
+            # interval. This retains a partially filled final page exactly.
+            num_kv_tokens = max(
+                0,
+                min(num_kv_tokens, selected_token_end)
+                - min(num_kv_tokens, selected_token_start),
+            )
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
