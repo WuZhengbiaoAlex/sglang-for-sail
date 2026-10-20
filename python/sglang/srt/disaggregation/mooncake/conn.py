@@ -221,6 +221,9 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Shared by status transitions, room cleanup and notification decisions.
+        # Never held while transferring buffers or sending control messages.
+        self._status_lock = threading.Lock()
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
@@ -1064,6 +1067,7 @@ class MooncakeKVManager(CommonKVManager):
             len(info.dst_kv_ptrs),
         )
         blocks = []
+        target_groups = None
         for i, j in enumerate(indices):
             src_ptr, dst_ptr = args.kv_data_ptrs[i], info.dst_kv_ptrs[j]
             width = info.dcp_token_item_lens[i]
@@ -1083,9 +1087,11 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 )
             elif not self._skip_replicated_target_kv(info.dst_attn_tp_size):
-                src_groups, dst_groups = group_concurrent_contiguous(
-                    target_plan.src_token_indices, target_plan.dst_token_indices
-                )
+                if target_groups is None:
+                    target_groups = group_concurrent_contiguous(
+                        target_plan.src_token_indices, target_plan.dst_token_indices
+                    )
+                src_groups, dst_groups = target_groups
                 blocks.extend(
                     (
                         src_ptr + int(src[0]) * width,
@@ -1801,19 +1807,42 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        with self._status_lock:
+            current = self.request_status.get(bootstrap_room)
+            # Failure is terminal until clear() releases this room. A late
+            # completion must also not recreate a room that has been cleared.
+            if current == KVPoll.Failed or (
+                current is None and status in (KVPoll.Failed, KVPoll.Success)
+            ):
+                return
+            super().update_status(bootstrap_room, status)
+
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._send_multipart_locked(
-            na.to_tcp(),
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ],
-            is_ipv6=na.is_ipv6,
-        )
+        # Order notifications per endpoint using the same socket lock as other
+        # control messages. Check state after taking that lock: a rejected room
+        # cannot send success behind its failure notification. If success is
+        # already being sent, failure is ordered after it. The status lock is
+        # released before the potentially blocking network send.
+        endpoint = na.to_tcp()
+        sock = self._connect(endpoint, is_ipv6=na.is_ipv6)
+        with self._socket_send_locks[endpoint]:
+            with self._status_lock:
+                if (
+                    status == KVPoll.Success
+                    and self.request_status.get(room) != KVPoll.Success
+                ):
+                    return
+            sock.send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ]
+            )
 
     def transfer_worker(
         self,
@@ -2548,6 +2577,10 @@ class MooncakeKVManager(CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
 
+    def clear(self) -> None:
+        with self.kv_mgr._status_lock:
+            super().clear()
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2703,6 +2736,10 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
+    def clear(self) -> None:
+        with self.kv_mgr._status_lock:
+            super().clear()
+
     def __init__(
         self,
         mgr: MooncakeKVManager,

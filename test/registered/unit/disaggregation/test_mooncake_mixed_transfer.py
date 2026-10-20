@@ -91,6 +91,7 @@ def manager(draft=2, tp=16):
     m.session_failures = defaultdict(int)
     m.session_lock = threading.Lock()
     m.failure_lock = threading.Lock()
+    m._status_lock = threading.Lock()
     m.failure_records = {}
     m.request_status = {}
     m.enable_staging = False
@@ -326,6 +327,237 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 self.assertEqual(m.request_status[2], KVPoll.WaitingForInput)
                 self.assertIn("Rejected Mooncake registration", m.failure_records[1])
                 self.assertEqual(m.sync_status_to_decode_endpoint.call_count, 1)
+
+    def test_rejection_during_transfer_remains_failed(self):
+        for hybrid in (False, True):
+            for phase in ("kv", "aux"):
+                with self.subTest(hybrid=hybrid, phase=phase):
+                    m = manager()
+                    m.is_mla_backend = not hybrid
+                    m.is_hybrid_mla_backend = hybrid
+                    m.enable_trace = False
+                    m.bootstrap_port = 8998
+                    m._staging_outstanding = defaultdict(int)
+                    m._validate_envelope_kv_layout = Mock()
+                    m.sync_status_to_decode_endpoint = (
+                        mc.MooncakeKVManager.sync_status_to_decode_endpoint.__get__(m)
+                    )
+                    m._status_messages = Mock()
+                    m._connect = Mock(
+                        return_value=NS(send_multipart=m._status_messages)
+                    )
+                    m._socket_send_locks = defaultdict(threading.Lock)
+                    for session, room in (("bad", 1), ("ok", 2)):
+                        m._register_decode_peer(registration(session), session)
+                        m.request_status[room] = KVPoll.WaitingForInput
+                        m.transfer_infos[room] = {
+                            session: mc.TransferInfo.from_zmq(request(session, room))
+                        }
+                    entered, resume = threading.Event(), threading.Event()
+                    errors = []
+
+                    def block(session, at):
+                        if session == "bad" and phase == at:
+                            entered.set()
+                            if not resume.wait(10):
+                                raise TimeoutError("Transfer was not resumed")
+                        return 0
+
+                    m._transfer_data = lambda session, blocks: block(session, "kv")
+                    m.send_aux = lambda req, *args: block(
+                        req.mooncake_session_id, "aux"
+                    )
+                    chunks = [
+                        NS(
+                            room=room,
+                            staging_counted=False,
+                            is_last_chunk=True,
+                            index_slice=slice(0, 1),
+                            prefill_kv_indices=np.array([0]),
+                            num_kv_tokens=1,
+                            state_indices=[],
+                            prefill_aux_index=0,
+                        )
+                        for room in (1, 2)
+                    ]
+
+                    def get_chunk():
+                        if not chunks:
+                            raise EndMessages()
+                        return chunks.pop(0)
+
+                    def worker():
+                        try:
+                            m.transfer_worker(NS(get=get_chunk), None)
+                        except EndMessages:
+                            pass
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    thread = threading.Thread(target=worker, daemon=True)
+                    thread.start()
+                    try:
+                        self.assertTrue(entered.wait(10), errors)
+                        m._register_decode_peer(registration("bad", count=1), "bad")
+                        self.assertEqual(m.check_status(1), KVPoll.Failed)
+                    finally:
+                        resume.set()
+                        thread.join(10)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(m.check_status(1), KVPoll.Failed)
+                    self.assertEqual(m.check_status(2), KVPoll.Success)
+                    sender = mc.MooncakeKVSender.__new__(mc.MooncakeKVSender)
+                    sender.kv_mgr = m
+                    sender.bootstrap_room = 1
+                    sender.conclude_state = None
+                    sender.trace_ctx = Mock()
+                    self.assertEqual(sender.poll(), KVPoll.Failed)
+                    notifications = [
+                        (int(c.args[0][0]), int(c.args[0][1]))
+                        for c in m._status_messages.call_args_list
+                    ]
+                    self.assertIn((1, KVPoll.Failed), notifications)
+                    self.assertNotIn((1, KVPoll.Success), notifications)
+                    self.assertIn((2, KVPoll.Success), notifications)
+                    self.assertFalse(m._staging_outstanding)
+
+    def test_success_notification_is_ordered_before_concurrent_failure(self):
+        m = manager()
+        m.request_status[1] = KVPoll.Success
+        sending, release = threading.Event(), threading.Event()
+        failing, failed = threading.Event(), threading.Event()
+        transitioned = threading.Event()
+        notifications, errors = [], []
+
+        def send(message):
+            status = int(message[1])
+            if status == KVPoll.Success:
+                sending.set()
+                if not release.wait(10):
+                    raise TimeoutError("Notification was not released")
+            notifications.append(status)
+
+        m._connect = Mock(return_value=NS(send_multipart=send))
+        m._socket_send_locks = defaultdict(threading.Lock)
+
+        def notify_success():
+            try:
+                mc.MooncakeKVManager.sync_status_to_decode_endpoint(
+                    m, "localhost", 1234, 1, KVPoll.Success, 0
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def reject():
+            try:
+                failing.set()
+                m.update_status(1, KVPoll.Failed)
+                transitioned.set()
+                mc.MooncakeKVManager.sync_status_to_decode_endpoint(
+                    m, "localhost", 1234, 1, KVPoll.Failed, 0
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                failed.set()
+
+        success_thread = threading.Thread(target=notify_success, daemon=True)
+        failure_thread = threading.Thread(target=reject, daemon=True)
+        success_thread.start()
+        try:
+            self.assertTrue(sending.wait(10), errors)
+            failure_thread.start()
+            self.assertTrue(failing.wait(10))
+            # State updates do not wait for the network send.
+            self.assertTrue(transitioned.wait(10))
+            self.assertEqual(m.check_status(1), KVPoll.Failed)
+            # Failure notification cannot overtake an already-started success.
+            self.assertFalse(failed.wait(0.1))
+        finally:
+            release.set()
+            success_thread.join(10)
+            if failure_thread.ident is not None:
+                failure_thread.join(10)
+        self.assertFalse(success_thread.is_alive())
+        self.assertFalse(failure_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(notifications, [KVPoll.Success, KVPoll.Failed])
+        self.assertEqual(m.check_status(1), KVPoll.Failed)
+
+    def test_failed_status_blocks_late_updates_and_notifications(self):
+        m = manager()
+        m.request_status[1] = KVPoll.WaitingForInput
+        m.update_status(1, KVPoll.Success)
+        m.update_status(1, KVPoll.Failed)
+        for status in (KVPoll.WaitingForInput, KVPoll.Transferring, KVPoll.Success):
+            m.update_status(1, status)
+            self.assertEqual(m.check_status(1), KVPoll.Failed)
+        m._status_messages = Mock()
+        m._connect = Mock(return_value=NS(send_multipart=m._status_messages))
+        m._socket_send_locks = defaultdict(threading.Lock)
+        mc.MooncakeKVManager.sync_status_to_decode_endpoint(
+            m, "localhost", 1234, 1, KVPoll.Success, 0
+        )
+        m._status_messages.assert_not_called()
+        sender = mc.MooncakeKVSender.__new__(mc.MooncakeKVSender)
+        sender.kv_mgr = m
+        sender.bootstrap_room = 1
+        sender.clear()
+        m.update_status(1, KVPoll.Success)
+        self.assertNotIn(1, m.request_status)
+        m.update_status(1, KVPoll.Bootstrapping)
+        self.assertEqual(m.check_status(1), KVPoll.Bootstrapping)
+
+    def test_target_groups_are_reused_across_entries(self):
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                m = manager()
+                m.kv_args.engine_rank = rank
+                m.attn_tp_rank = rank
+                m.is_mla_backend = False
+                m.is_hybrid_mla_backend = True
+                m.kv_args.kv_data_ptrs = [0x100000 + i * 0x100000 for i in range(26)]
+                m.kv_args.kv_item_lens = [64] * 24 + [1024] * 2
+                layers = list(range(24)) + [24, 24]
+                m.kv_args.kv_layer_ids = layers
+                wire = registration()
+                wire[4] = struct.pack(
+                    "26Q", *[0x10000000 + i * 0x100000 for i in range(26)]
+                )
+                wire[12] = struct.pack("26I", *layers)
+                wire[18] = struct.pack("26Q", *([64] * 24 + [2048] * 2))
+                m._register_decode_peer(wire, "ok")
+                info = m.decode_kv_args_table["ok"]
+                m._validate_envelope_kv_layout = Mock()
+                m._transfer_data = Mock(return_value=0)
+                with patch.object(
+                    mc,
+                    "group_concurrent_contiguous",
+                    wraps=mc.group_concurrent_contiguous,
+                ) as grouping:
+                    m.send_kvcache_mixed(
+                        "ok",
+                        np.array([1, 3]),
+                        np.array([4, 7]),
+                        info=info,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=65,
+                    )
+                self.assertEqual(grouping.call_count, 1 if rank == 0 else 0)
+                blocks = m._transfer_data.call_args.args[1]
+                expected = []
+                if rank == 0:
+                    for src, dst in zip(
+                        m.kv_args.kv_data_ptrs[:24], info.dst_kv_ptrs[:24]
+                    ):
+                        expected.extend(
+                            [(src + 64, dst + 256, 64), (src + 192, dst + 448, 1)]
+                        )
+                # Compare target descriptors, including discontiguous pages and a one-token tail.
+                target_blocks = [b for b in blocks if b[0] < m.kv_args.kv_data_ptrs[24]]
+                self.assertEqual(target_blocks, expected)
 
     def test_staging_prefetch_uses_one_registration_lookup(self):
         class RemovedAfterRead(dict):
