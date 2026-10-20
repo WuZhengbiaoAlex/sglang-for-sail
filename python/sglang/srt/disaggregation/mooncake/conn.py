@@ -1245,6 +1245,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             len(info.dst_kv_ptrs),
         )
         blocks = []
+        target_groups = None
         for i, j in enumerate(indices):
             src_ptr, dst_ptr = args.kv_data_ptrs[i], info.dst_kv_ptrs[j]
             width = info.dcp_token_item_lens[i]
@@ -1264,9 +1265,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 )
             elif not self._skip_replicated_target_kv(info.dst_attn_tp_size):
-                src_groups, dst_groups = group_concurrent_contiguous(
-                    target_plan.src_token_indices, target_plan.dst_token_indices
-                )
+                if target_groups is None:
+                    target_groups = group_concurrent_contiguous(
+                        target_plan.src_token_indices, target_plan.dst_token_indices
+                    )
+                src_groups, dst_groups = target_groups
                 blocks.extend(
                     (
                         src_ptr + int(src[0]) * width,
