@@ -149,6 +149,7 @@ class KVArgsRegisterInfo:
     dst_draft_entry_count: int = 0
     dst_draft_head_num: int = 0
     dst_draft_total_head_num: int = 0
+    dst_draft_token_major: bool = False
     dst_page_size: Optional[int] = None
     dcp_dst_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
@@ -206,6 +207,7 @@ class KVArgsRegisterInfo:
             dst_draft_head_num=int(msg[20]) if len(msg) > 20 else 0,
             dst_draft_total_head_num=int(msg[21]) if len(msg) > 21 else 0,
             dst_page_size=int(msg[22]) if len(msg) > 22 else None,
+            dst_draft_token_major=(msg[23] == b"1") if len(msg) > 23 else False,
         )
 
 
@@ -225,13 +227,14 @@ class MooncakeKVManager(CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
             self.session_lock = threading.Lock()
+            self.rejected_registrations: Dict[str, str] = {}
+            self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -919,6 +922,14 @@ class MooncakeKVManager(CommonKVManager):
             self.attn_tp_size // dst_attn_tp_size
         ) != 0
 
+    def _deduplicate_mla_senders(self, info) -> bool:
+        # Older bootstrap servers do not advertise source drafts. In that case
+        # retain all senders if decode has a head-sharded draft.
+        has_draft = info.draft_kv_entry_count
+        if has_draft is None:
+            has_draft = self.kv_args.draft_kv_entry_count
+        return self.is_mla_backend and not has_draft
+
     def _requires_dcp_entry_geometry(self, info: KVArgsRegisterInfo) -> bool:
         return bool(
             info.requires_dcp_relayout
@@ -933,6 +944,12 @@ class MooncakeKVManager(CommonKVManager):
         args = self.kv_args
         n = len(args.kv_item_lens)
         draft = args.draft_kv_entry_count
+        if draft and not (args.draft_kv_token_major and info.dst_draft_token_major):
+            raise ValueError(
+                "Mixed target/draft transfer requires verified token-major draft K/V "
+                "buffers on both peers; packed layouts such as vectorized_5d "
+                "and peers without layout metadata are unsupported"
+            )
         if draft and getattr(self, "dcp_size", 1) != 1:
             raise ValueError("Mixed target/draft transfer requires Prefill DCP1")
         if not 0 <= draft <= n:
@@ -1868,6 +1885,12 @@ class MooncakeKVManager(CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
+                        if req.mooncake_session_id in self.rejected_registrations:
+                            self._fail_bootstrap_request(
+                                req,
+                                self.rejected_registrations[req.mooncake_session_id],
+                            )
+                            break
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
@@ -2157,6 +2180,55 @@ class MooncakeKVManager(CommonKVManager):
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
 
+    def _fail_bootstrap_request(self, req: TransferInfo, reason: str) -> None:
+        self.record_failure(req.room, reason)
+        self.update_status(req.room, KVPoll.Failed)
+        if not req.is_dummy:
+            rank = (
+                self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                + self.pp_rank * self.attn_cp_size
+                + self.attn_cp_rank
+            )
+            try:
+                self.sync_status_to_decode_endpoint(
+                    req.endpoint, req.dst_port, req.room, KVPoll.Failed, rank
+                )
+            except zmq.ZMQError:
+                logger.exception(
+                    "Failed to notify decode of rejected room %s", req.room
+                )
+
+    def _register_decode_peer(self, msg: List[bytes], session_id: str) -> None:
+        try:
+            info = KVArgsRegisterInfo.from_zmq(msg)
+            try:
+                info.requires_dcp_relayout = self.requires_dcp_relayout(
+                    info.dst_dcp_size, info.dst_dcp_rank
+                )
+            except RuntimeError as exc:
+                # Topology validation uses RuntimeError on the common path.
+                raise ValueError(str(exc)) from exc
+            if self._requires_dcp_entry_geometry(info):
+                self.prepare_dcp_entry_geometry(info)
+        except (ValueError, IndexError, TypeError, OverflowError, struct.error) as exc:
+            reason = f"Rejected Mooncake registration for {session_id}: {exc}"
+            logger.error(reason)
+            # This is a layout failure, not a liveness failure: a successful
+            # heartbeat must not make the rejected registration usable again.
+            self.rejected_registrations[session_id] = reason
+            self.decode_kv_args_table.pop(session_id, None)
+            for requests in list(self.transfer_infos.values()):
+                req = requests.get(session_id)
+                if req is not None:
+                    self._fail_bootstrap_request(req, reason)
+            return
+        self.decode_kv_args_table[session_id] = info
+        self.rejected_registrations.pop(session_id, None)
+        with self.session_lock:
+            self.failed_sessions.discard(session_id)
+            self.session_failures.pop(session_id, None)
+        logger.debug("Register KVArgs from %s successfully", session_id)
+
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -2220,34 +2292,55 @@ class MooncakeKVManager(CommonKVManager):
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
                         )
                     continue
-                mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                try:
+                    mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+                except (IndexError, UnicodeError):
+                    logger.exception("Malformed bootstrap message without a session ID")
+                    continue
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if self._requires_dcp_entry_geometry(decode_kv_args):
-                        self.prepare_dcp_entry_geometry(decode_kv_args)
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
+                    self._register_decode_peer(waiting_req_bytes, mooncake_session_id)
                     continue
                 else:
+                    if mooncake_session_id in self.rejected_registrations:
+                        # Only the routing header is needed to fail the room;
+                        # malformed payloads must not delay rejection until send.
+                        try:
+                            req = TransferInfo(
+                                room=int(room),
+                                endpoint=waiting_req_bytes[1].decode("ascii"),
+                                dst_port=int(waiting_req_bytes[2]),
+                                mooncake_session_id=mooncake_session_id,
+                                dst_kv_indices=None,
+                                dst_aux_index=None,
+                                dst_state_indices=[],
+                                required_dst_info_num=1,
+                                is_dummy=False,
+                            )
+                        except (ValueError, IndexError):
+                            logger.exception(
+                                "Malformed request for rejected session %s",
+                                mooncake_session_id,
+                            )
+                            continue
+                        self._fail_bootstrap_request(
+                            req, self.rejected_registrations[mooncake_session_id]
+                        )
+                        continue
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    if self.request_status.get(room) == KVPoll.Failed:
+                        self._fail_bootstrap_request(
+                            transfer_info,
+                            self.failure_records.get(
+                                room, "Bootstrap room already failed"
+                            ),
+                        )
+                        continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2309,7 +2402,10 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
                 if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
+                    if (
+                        bootstrap_room in self.request_status
+                        and self.check_status(bootstrap_room) != KVPoll.Failed
+                    ):
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
@@ -2452,6 +2548,12 @@ class MooncakeKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        # Decode metadata can arrive before the scheduler creates this sender.
+        # update_status(Failed) intentionally ignores unknown rooms, but the
+        # recorded rejection must still fail this request without a timeout.
+        with self.kv_mgr.failure_lock:
+            if self.bootstrap_room in self.kv_mgr.failure_records:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = None
         self.init_time = time.time()
         self._init_trace_ctx()
@@ -2678,6 +2780,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                                 "ascii"
                             ),
                             str(self.kv_mgr.kv_args.page_size).encode("ascii"),
+                            b"1" if self.kv_mgr.kv_args.draft_kv_token_major else b"0",
                         ]
                     )
             except zmq.ZMQError:

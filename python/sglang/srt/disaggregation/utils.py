@@ -1360,6 +1360,7 @@ def set_draft_kv_transfer_metadata(
     kv_args.draft_kv_entry_count = 0
     kv_args.draft_kv_head_num = 0
     kv_args.draft_total_kv_head_num = 0
+    kv_args.draft_kv_token_major = False
 
     if draft_kv_pool is None or draft_kv_entry_count <= 0:
         return
@@ -1386,6 +1387,32 @@ def set_draft_kv_transfer_metadata(
     kv_args.draft_kv_entry_count = int(draft_kv_entry_count)
     kv_args.draft_kv_head_num = head_num
     kv_args.draft_total_kv_head_num = int(total_head_num)
+
+    # A contiguous allocation is not necessarily contiguous per token (e.g.
+    # vectorized_5d). Inspect the buffers represented by the transfer pointers,
+    # including their row stride and advertised page width. Keep draft metadata
+    # even for unsupported layouts: only the mixed path must reject them.
+    buffers = list(getattr(backing_pool, "k_buffer", [])) + list(
+        getattr(backing_pool, "v_buffer", [])
+    )
+    if not buffers:
+        return
+    ptrs, lengths, item_lens = draft_kv_pool.get_contiguous_buf_infos()
+    kv_args.draft_kv_token_major = bool(
+        len(buffers) == len(ptrs) == len(lengths) == len(item_lens)
+        and len(buffers) == draft_kv_entry_count
+        and all(
+            tensor.ndim == 3
+            and tensor.shape[1] == head_num
+            and tensor.is_contiguous()
+            and tensor.stride() == (head_num * tensor.shape[2], tensor.shape[2], 1)
+            and tensor.data_ptr() == ptr
+            and tensor.numel() * tensor.element_size() == length
+            and tensor.stride(0) * tensor.element_size() * backing_pool.page_size
+            == item_len
+            for tensor, ptr, length, item_len in zip(buffers, ptrs, lengths, item_lens)
+        )
+    )
 
 
 def get_draft_total_num_kv_heads(scheduler) -> Optional[int]:
