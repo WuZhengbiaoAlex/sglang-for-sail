@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -2201,16 +2201,22 @@ class MooncakeKVManager(CommonKVManager):
     def _register_decode_peer(self, msg: List[bytes], session_id: str) -> None:
         try:
             info = KVArgsRegisterInfo.from_zmq(msg)
-            try:
-                info.requires_dcp_relayout = self.requires_dcp_relayout(
-                    info.dst_dcp_size, info.dst_dcp_rank
-                )
-            except RuntimeError as exc:
-                # Topology validation uses RuntimeError on the common path.
-                raise ValueError(str(exc)) from exc
+            info.requires_dcp_relayout = self.requires_dcp_relayout(
+                info.dst_dcp_size, info.dst_dcp_rank
+            )
             if self._requires_dcp_entry_geometry(info):
                 self.prepare_dcp_entry_geometry(info)
-        except (ValueError, IndexError, TypeError, OverflowError, struct.error) as exc:
+        except (
+            ValueError,
+            RuntimeError,
+            IndexError,
+            TypeError,
+            OverflowError,
+            struct.error,
+        ) as exc:
+            # Shared topology and layer-mapping validators raise RuntimeError.
+            # Keep this boundary limited to registration parsing/validation so
+            # one malformed peer cannot terminate the shared bootstrap loop.
             reason = f"Rejected Mooncake registration for {session_id}: {exc}"
             logger.error(reason)
             # This is a layout failure, not a liveness failure: a successful

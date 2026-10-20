@@ -312,6 +312,20 @@ def build_draft_head_transfer_blocks(
         raise ValueError("Invalid draft token indices")
     if not width:
         return []
+    if width == src_token_bytes == dst_token_bytes:
+        # Full rows may be merged only when both address streams are contiguous.
+        # Head slices leave gaps in at least one peer's rows and stay separate.
+        src_groups, dst_groups = group_concurrent_contiguous(
+            plan.src_token_indices, plan.dst_token_indices
+        )
+        return [
+            (
+                src_ptr + int(src[0]) * src_token_bytes + src_offset,
+                dst_ptr + int(dst[0]) * dst_token_bytes + dst_offset,
+                len(src) * width,
+            )
+            for src, dst in zip(src_groups, dst_groups)
+        ]
     return [
         (
             src_ptr + int(src) * src_token_bytes + src_offset,
