@@ -1622,8 +1622,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
-        if self.draft_kv_entry_count is None and "draft_kv_entry_count" in data:
-            self.draft_kv_entry_count = int(data["draft_kv_entry_count"])
+        if "draft_kv_entry_count" in data:
+            # Layer/PP shards can export different numbers of draft entries.
+            # This server-wide value advertises presence for sender selection;
+            # a target-only shard must not hide a later draft-bearing shard.
+            self.draft_kv_entry_count = max(
+                self.draft_kv_entry_count or 0, int(data["draft_kv_entry_count"])
+            )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size

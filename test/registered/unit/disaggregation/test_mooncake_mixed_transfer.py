@@ -193,6 +193,25 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     else:
                         self.assertEqual(ids, [7, 8, 9, 10, 11])
 
+    def test_mla_layer_ids_preserve_subclass_tensor_groups(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        class GroupedPool(MLATokenToKVPool):
+            def get_contiguous_buf_infos(self):
+                return list(range(self.entry_count)), [], []
+
+        p = GroupedPool.__new__(GroupedPool)
+        p.start_layer = 3
+        p.layer_num = 2
+        for groups in (1, 2, 3):
+            p.entry_count = groups * 2
+            self.assertEqual(p.get_kv_layer_ids(), [3, 4] * groups)
+        p.entry_count = 0
+        self.assertEqual(p.get_kv_layer_ids(), [])
+        p.entry_count = 3
+        with self.assertRaisesRegex(ValueError, "complete layer groups"):
+            p.get_kv_layer_ids()
+
     def test_layer_split_mixed_pool_mapping_and_addresses(self):
         import ctypes
 
@@ -390,6 +409,191 @@ class TestMooncakeMixedTransfer(CustomTestCase):
             )
             info = PrefillServerInfo(**json.loads(response.text))
             self.assertEqual(getattr(info, "draft_kv_entry_count", None), count)
+
+    def test_layer_split_draft_presence_is_registration_order_independent(self):
+        import asyncio
+        import json
+        from unittest.mock import AsyncMock
+
+        from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+        for counts in ((0, 2), (2, 0), (0, 0)):
+            with self.subTest(counts=counts):
+                with patch.object(CommonKVBootstrapServer, "run"):
+                    server = CommonKVBootstrapServer("127.0.0.1", 0)
+                for cp, count in enumerate(counts):
+                    for tp in range(16):
+                        data = dict(
+                            attn_tp_size=16,
+                            attn_tp_rank=tp,
+                            attn_cp_size=2,
+                            attn_cp_rank=cp,
+                            attn_dp_size=1,
+                            attn_dp_rank=0,
+                            pp_size=1,
+                            pp_rank=0,
+                            system_dp_size=1,
+                            system_dp_rank=0,
+                            rank_ip="127.0.0.1",
+                            rank_port=1234 + cp * 16 + tp,
+                            page_size=64,
+                            kv_cache_dtype="float16",
+                            load_balance_method="follow_bootstrap_room",
+                            draft_kv_entry_count=count,
+                            enable_dsa_cache_layer_split=True,
+                        )
+                        response = asyncio.run(
+                            server._handle_route_put(
+                                NS(json=AsyncMock(return_value=data))
+                            )
+                        )
+                        self.assertEqual(response.status, 200)
+                response = asyncio.run(
+                    server._handle_route_get(
+                        NS(
+                            query={
+                                k: "-1"
+                                for k in (
+                                    "prefill_dp_rank",
+                                    "prefill_cp_rank",
+                                    "target_tp_rank",
+                                    "target_pp_rank",
+                                )
+                            }
+                        )
+                    )
+                )
+                self.assertEqual(response.status, 200)
+                info = PrefillServerInfo(**json.loads(response.text))
+                self.assertEqual(info.draft_kv_entry_count, max(counts))
+                for plain in (True, False):
+                    m = manager(tp=8)
+                    m.is_mla_backend = plain
+                    m.is_hybrid_mla_backend = not plain
+                    m._resolve_rank_mapping(info)
+                    expected = 2 if plain and not any(counts) else 4
+                    self.assertEqual(info.required_prefill_response_num, expected)
+                    r = mc.MooncakeKVReceiver.__new__(mc.MooncakeKVReceiver)
+                    r.kv_mgr = m
+                    r.prefill_info = info
+                    for key in (
+                        "target_tp_rank",
+                        "target_tp_ranks",
+                        "target_cp_ranks",
+                        "target_pp_ranks",
+                    ):
+                        setattr(r, key, getattr(info, key))
+                    r.bootstrap_addr = "localhost"
+                    r.prefill_dp_rank = 0
+                    r.bootstrap_room = 99
+                    r.conclude_state = None
+                    m.connection_pool = {}
+                    r._get_bootstrap_info_from_server = lambda dp, cp, tp, pp: dict(
+                        rank_ip="localhost",
+                        rank_port=1000 + cp * 16 + tp,
+                        sender=tp * 2 + cp,
+                    )
+                    r._register_kv_args = Mock(return_value=True)
+                    r._setup_bootstrap_infos()
+                    real = [b["sender"] for b in r.bootstrap_infos if not b["is_dummy"]]
+                    self.assertEqual(
+                        set(real), {0, 1} if expected == 2 else {0, 1, 2, 3}
+                    )
+                    m.request_status[99] = KVPoll.WaitingForInput
+                    m.required_prefill_response_num_table[99] = expected
+                    states = []
+                    # Duplicate responses must not cause early completion.
+                    ids = real[:-1] + real[:-1] + real[-1:]
+                    msgs = [
+                        [b"99", str(int(KVPoll.Success)).encode(), str(rank).encode()]
+                        for rank in ids
+                    ]
+                    self.assertEqual(
+                        run_loop(
+                            m,
+                            m.start_decode_thread,
+                            msgs,
+                            lambda: states.append(m.request_status[99]),
+                        ),
+                        [],
+                    )
+                    self.assertTrue(
+                        all(state != KVPoll.Success for state in states[:-1])
+                    )
+                    self.assertEqual(states[-1], KVPoll.Success)
+
+    def test_cp_filtered_chunks_keep_token_count_and_destination_alignment(self):
+        import sglang.srt.disaggregation.common.conn as common
+
+        for total_tokens in (450, 512):
+            for chunks in ((8,), (3, 5), (5, 3), (1,) * 8):
+                for cp in (0, 1):
+                    with self.subTest(tokens=total_tokens, chunks=chunks, cp=cp):
+                        sender = mc.MooncakeKVSender.__new__(mc.MooncakeKVSender)
+                        sender.curr_idx = 0
+                        sender.num_kv_indices = 8
+                        sender.kv_mgr = NS(
+                            enable_all_cp_ranks_for_transfer=True,
+                            attn_cp_size=2,
+                            attn_cp_rank=cp,
+                            is_dummy_cp_rank=False,
+                            kv_args=NS(page_size=64),
+                            add_transfer_request=Mock(),
+                        )
+                        sender.bootstrap_room = 9
+                        sender.aux_index = 0
+                        sender.trace_ctx = Mock()
+                        sender._transfer_num_kv_indices = 0
+                        sender._transfer_num_state_indices = 0
+                        send = getattr(
+                            mc.MooncakeKVSender.send,
+                            "__wrapped__",
+                            mc.MooncakeKVSender.send,
+                        )
+                        start = 0
+                        observed = []
+                        for pages in chunks:
+                            count = min(pages * 64, max(0, total_tokens - start * 64))
+                            with patch.object(
+                                common,
+                                "get_parallel",
+                                return_value=NS(enable_dsa_cache_layer_split=False),
+                            ), patch.object(
+                                mc,
+                                "get_parallel",
+                                return_value=NS(enable_dsa_cache_layer_split=False),
+                            ):
+                                send(
+                                    sender,
+                                    np.arange(start, start + pages, dtype=np.int32),
+                                    num_kv_tokens=count,
+                                )
+                            call = sender.kv_mgr.add_transfer_request.call_args
+                            source, index_slice = call.args[1:3]
+                            dest = np.arange(20, 28, dtype=np.int32)[index_slice]
+                            plan = mc.build_dcp_token_transfer_plan(
+                                source,
+                                dest,
+                                physical_page_size=64,
+                                dcp_size=1,
+                                dcp_rank=0,
+                                num_kv_tokens=call.kwargs["num_kv_tokens"],
+                            )
+                            observed.extend(
+                                zip(
+                                    plan.src_token_indices.tolist(),
+                                    plan.dst_token_indices.tolist(),
+                                )
+                            )
+                            start += pages
+                        expected = [
+                            (t, 20 * 64 + t)
+                            for t in range(cp * 256, min((cp + 1) * 256, total_tokens))
+                        ]
+                        self.assertEqual(observed, expected)
+                        self.assertTrue(
+                            sender.kv_mgr.add_transfer_request.call_args.args[3]
+                        )
 
     def test_receiver_mapping_dummy_and_completion(self):
         for plain, hybrid, draft, source in [
