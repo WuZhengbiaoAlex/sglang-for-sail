@@ -327,6 +327,144 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 self.assertIn("Rejected Mooncake registration", m.failure_records[1])
                 self.assertEqual(m.sync_status_to_decode_endpoint.call_count, 1)
 
+    def test_staging_prefetch_uses_one_registration_lookup(self):
+        class RemovedAfterRead(dict):
+            def get(self, key, default=None):
+                return self.pop(key, default)
+
+        for present in (True, False):
+            with self.subTest(present=present):
+                m = manager()
+                m.enable_staging = True
+                m.kv_buffer_tensors = []
+                m._staging_ctx = NS(prefetch_requested=set(), prefetch_sockets={})
+                m.transfer_infos[1] = {"s": mc.TransferInfo.from_zmq(request("s", 1))}
+                m.decode_kv_args_table = RemovedAfterRead(
+                    {"s": NS(dst_attn_tp_size=8)} if present else {}
+                )
+                with patch.object(
+                    mc, "get_schedule", return_value=NS(chunked_prefill_size=64)
+                ), patch(
+                    "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
+                ) as prefetch:
+                    m._prefetch_staging_reqs(1)
+                self.assertEqual(prefetch.call_count, int(present))
+
+    def test_registration_changes_do_not_terminate_transfer_worker(self):
+        for change in ("reject", "recover", "missing"):
+            with self.subTest(change=change):
+                m = manager()
+                m.enable_trace = False
+                m.bootstrap_port = 8998
+                m._staging_outstanding = defaultdict(int)
+                m.send_kvcache_mixed = Mock(return_value=0)
+                m.send_aux = Mock(return_value=0)
+                for session, room in (("changing", 1), ("ok", 2)):
+                    m._register_decode_peer(registration(session), session)
+                    m.request_status[room] = KVPoll.WaitingForInput
+                    m.transfer_infos[room] = {
+                        session: mc.TransferInfo.from_zmq(request(session, room))
+                    }
+                if change == "recover":
+                    m.rejected_registrations["changing"] = "layout rejected"
+                elif change == "missing":
+                    m.decode_kv_args_table.pop("changing")
+
+                reached = threading.Event()
+                resume = threading.Event()
+
+                class InterleavedDict(dict):
+                    """Pause a reader at a controlled registration-update boundary."""
+
+                    def pause(self, key):
+                        if key == "changing" and not reached.is_set():
+                            reached.set()
+                            if not resume.wait(10):
+                                raise TimeoutError("Registration update did not finish")
+
+                    def __contains__(self, key):
+                        present = super().__contains__(key)
+                        if change == "recover":
+                            self.pause(key)
+                        return present
+
+                    def __getitem__(self, key):
+                        if change == "reject":
+                            self.pause(key)
+                        return super().__getitem__(key)
+
+                    def get(self, key, default=None):
+                        if change == "reject":
+                            self.pause(key)
+                        value = super().get(key, default)
+                        if change == "recover":
+                            self.pause(key)
+                        return value
+
+                if change == "reject":
+                    m.decode_kv_args_table = InterleavedDict(m.decode_kv_args_table)
+                elif change == "recover":
+                    m.rejected_registrations = InterleavedDict(m.rejected_registrations)
+
+                chunks = [
+                    NS(
+                        room=room,
+                        staging_counted=False,
+                        is_last_chunk=True,
+                        index_slice=slice(0, 1),
+                        prefill_kv_indices=np.array([0]),
+                        num_kv_tokens=1,
+                        state_indices=[],
+                        prefill_aux_index=0,
+                    )
+                    for room in (1, 2)
+                ]
+                errors = []
+
+                def get_chunk():
+                    if not chunks:
+                        raise EndMessages()
+                    return chunks.pop(0)
+
+                def worker():
+                    try:
+                        m.transfer_worker(NS(get=get_chunk), None)
+                    except EndMessages:
+                        pass
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                thread = threading.Thread(target=worker, daemon=True)
+                thread.start()
+                try:
+                    if change != "missing":
+                        self.assertTrue(reached.wait(10), errors)
+                        wire = registration(
+                            "changing", count=1 if change == "reject" else 2
+                        )
+                        m._register_decode_peer(wire, "changing")
+                finally:
+                    resume.set()
+                    thread.join(10)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(m.request_status[1], KVPoll.Failed)
+                self.assertEqual(m.request_status[2], KVPoll.Success)
+                self.assertIn(1, m.failure_records)
+                self.assertEqual(m.send_kvcache_mixed.call_count, 1)
+                self.assertEqual(m.send_kvcache_mixed.call_args.args[0], "ok")
+                self.assertEqual(m.send_aux.call_count, 1)
+                self.assertNotIn(1, m.transfer_infos)
+                self.assertNotIn(2, m.transfer_infos)
+                self.assertFalse(m._staging_outstanding)
+                statuses = [
+                    (c.args[2], c.args[3])
+                    for c in m.sync_status_to_decode_endpoint.call_args_list
+                ]
+                self.assertIn((1, KVPoll.Failed), statuses)
+                self.assertIn((2, KVPoll.Success), statuses)
+                self.assertNotIn((1, KVPoll.Success), statuses)
+
     def test_rejected_session_recovers_only_after_valid_registration(self):
         m = manager()
         m.request_status = {1: KVPoll.Bootstrapping}

@@ -604,13 +604,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return
 
         room_infos = self.transfer_infos.get(room, {})
-        needs_staging = any(
-            not tinfo.is_dummy
-            and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
-            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
-            != self.attn_tp_size
-            for tinfo in room_infos.values()
-        )
+        needs_staging = False
+        for tinfo in room_infos.values():
+            if tinfo.is_dummy:
+                continue
+            info = self.decode_kv_args_table.get(tinfo.mooncake_session_id)
+            if info is not None and info.dst_attn_tp_size != self.attn_tp_size:
+                needs_staging = True
+                break
         if not needs_staging:
             return
 
@@ -2372,11 +2373,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
-                        if req.mooncake_session_id in self.rejected_registrations:
-                            self._fail_bootstrap_request(
-                                req,
-                                self.rejected_registrations[req.mooncake_session_id],
-                            )
+                        # Bootstrap may reject or restore a session concurrently.
+                        # Snapshot the reason instead of checking then indexing.
+                        rejection_reason = self.rejected_registrations.get(
+                            req.mooncake_session_id
+                        )
+                        if rejection_reason is not None:
+                            self._fail_bootstrap_request(req, rejection_reason)
                             break
                         # Early exit if the request has failed
                         with self.session_lock:
@@ -2391,9 +2394,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 )
                                 break
 
-                        target_rank_registration_info: KVArgsRegisterInfo = (
-                            self.decode_kv_args_table[req.mooncake_session_id]
+                        target_rank_registration_info = self.decode_kv_args_table.get(
+                            req.mooncake_session_id
                         )
+                        if target_rank_registration_info is None:
+                            self._fail_bootstrap_request(
+                                req,
+                                "Mooncake registration unavailable for session "
+                                f"{req.mooncake_session_id}; it may have been rejected "
+                                "while the transfer was queued",
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
