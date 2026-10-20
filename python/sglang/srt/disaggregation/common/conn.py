@@ -1039,6 +1039,9 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
 
+    def _deduplicate_mla_senders(self, info: PrefillServerInfo) -> bool:
+        return self.is_mla_backend
+
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
@@ -1078,7 +1081,7 @@ class CommonKVManager(BaseKVManager):
             # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
-            if self.is_mla_backend:
+            if self._deduplicate_mla_senders(info):
                 required_prefill_response_num = 1
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
@@ -1187,6 +1190,7 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "draft_kv_entry_count": self.kv_args.draft_kv_entry_count,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1831,7 +1835,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if self.kv_mgr._deduplicate_mla_senders(self.prefill_info):
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
@@ -2122,6 +2126,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.draft_kv_entry_count: Optional[int] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2297,6 +2302,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                draft_kv_entry_count=self.draft_kv_entry_count,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
