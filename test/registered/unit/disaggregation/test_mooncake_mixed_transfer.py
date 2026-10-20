@@ -166,6 +166,181 @@ def pool(layout, heads=1):
 
 
 class TestMooncakeMixedTransfer(CustomTestCase):
+    def test_mla_pool_layer_ids_match_exported_buffers(self):
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+
+        for cls in (MLATokenToKVPool, DSATokenToKVPool, LayerSplitDSATokenToKVPool):
+            for shard in (0, 1):
+                with self.subTest(pool=cls.__name__, shard=shard):
+                    p = cls.__new__(cls)
+                    p.start_layer = 7
+                    p.layer_num = 5
+                    p.page_size = 64
+                    p.layer_shard_rank = shard
+                    p.layer_shard_size = 2
+                    p.kv_buffer = [
+                        torch.zeros((64, 1, 16), dtype=torch.uint8) for _ in range(5)
+                    ]
+                    ptrs, _, _ = p.get_contiguous_buf_infos()
+                    ids = p.get_kv_layer_ids()
+                    self.assertEqual(ptrs, [p.kv_buffer[i - 7].data_ptr() for i in ids])
+                    if cls is LayerSplitDSATokenToKVPool:
+                        lo, hi = p._owned_local_layer_range()
+                        self.assertEqual(ids, list(range(7 + lo, 7 + hi)))
+                    else:
+                        self.assertEqual(ids, [7, 8, 9, 10, 11])
+
+    def test_layer_split_mixed_pool_mapping_and_addresses(self):
+        import ctypes
+
+        from sglang.srt.disaggregation.utils import get_transfer_kv_layer_ids
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        def target(split, shard=1):
+            cls = LayerSplitDSATokenToKVPool if split else DSATokenToKVPool
+            p = cls.__new__(cls)
+            p.start_layer = 0
+            p.layer_num = 4
+            p.page_size = 64
+            if split:
+                p.layer_shard_rank = shard
+                p.layer_shard_size = 2
+            p.kv_buffer = [
+                torch.zeros(
+                    (192 if not split or i // 2 == shard else 0, 1, 16),
+                    dtype=torch.uint8,
+                )
+                for i in range(4)
+            ]
+            return p
+
+        # Real exported pool geometry; only the native transport is replaced.
+        for split in (False, True):
+            for dst_tp in (16, 8):
+                for count in (65, 128):
+                    with self.subTest(split=split, dst_tp=dst_tp, count=count):
+                        dt, dd = target(False), pool("nhd", heads=16 // dst_tp)
+                        dd.start_layer = 0
+                        dest = dt.kv_buffer + dd.k_buffer + dd.v_buffer
+                        for t in dest:
+                            t.zero_()
+                        writes = {
+                            t.data_ptr(): np.zeros(t.nbytes, dtype=np.uint8)
+                            for t in dest
+                        }
+                        dst_ptrs, _, dst_sizes = dt.get_contiguous_buf_infos()
+                        dp, _, ds = dd.get_contiguous_buf_infos()
+                        dst_ptrs += dp
+                        dst_sizes += ds
+                        dst_ids = get_transfer_kv_layer_ids(dt, dd, 4)
+                        self.assertEqual(dst_ids, [0, 1, 2, 3, 4, 4])
+                        for rank in range(16 // dst_tp):
+                            st, sd = target(split), pool("nhd")
+                            sd.start_layer = 0
+                            for layer, t in enumerate(st.kv_buffer):
+                                t.fill_(layer + 1)
+                            for t in sd.k_buffer + sd.v_buffer:
+                                t.fill_(rank + 10)
+                            m = manager()
+                            m.attn_cp_size = 2 if split else 1
+                            m.attn_cp_rank = 1 if split else 0
+                            a = m.kv_args
+                            a.engine_rank = rank
+                            a.prefill_start_layer = 2 if split else 0
+                            a.prefill_end_layer = 4
+                            sp, _, ss = st.get_contiguous_buf_infos()
+                            kp, _, ks = sd.get_contiguous_buf_infos()
+                            a.kv_data_ptrs = sp + kp
+                            a.kv_item_lens = ss + ks
+                            a.kv_layer_ids = get_transfer_kv_layer_ids(st, sd, 4)
+                            self.assertEqual(
+                                a.kv_layer_ids,
+                                ([2, 3] if split else [0, 1, 2, 3]) + [4, 4],
+                            )
+                            wire = registration()
+                            wire[4] = struct.pack(f"{len(dst_ptrs)}Q", *dst_ptrs)
+                            wire[8] = str(dst_tp).encode()
+                            wire[9] = b"1024"
+                            wire[12] = struct.pack("6I", *dst_ids)
+                            wire[18] = struct.pack("6Q", *dst_sizes)
+                            wire[20] = str(16 // dst_tp).encode()
+                            m._register_decode_peer(wire, "s")
+                            self.assertNotIn("s", m.rejected_registrations)
+                            info = m.decode_kv_args_table["s"]
+
+                            def transfer(session, blocks):
+                                for src, dst, size in blocks:
+                                    owners = [
+                                        t
+                                        for t in dest
+                                        if t.data_ptr() <= dst
+                                        and dst + size <= t.data_ptr() + t.nbytes
+                                    ]
+                                    self.assertEqual(len(owners), 1)
+                                    base = owners[0].data_ptr()
+                                    writes[base][dst - base : dst - base + size] += 1
+                                    ctypes.memmove(dst, src, size)
+                                return 0
+
+                            m._transfer_data = transfer
+                            m._validate_envelope_kv_layout = Mock()
+                            self.assertEqual(
+                                m.send_kvcache_mixed(
+                                    "s",
+                                    np.array([0, 1]),
+                                    np.array([1, 2]),
+                                    info=info,
+                                    src_page_offset=0,
+                                    decode_prefix_len=0,
+                                    num_kv_tokens=count,
+                                ),
+                                0,
+                            )
+                        for layer, t in enumerate(dt.kv_buffer):
+                            expected = torch.zeros_like(t)
+                            if not split or layer >= 2:
+                                expected[64 : 64 + count] = layer + 1
+                            self.assertTrue(torch.equal(t, expected))
+                            self.assertTrue(
+                                np.array_equal(
+                                    writes[t.data_ptr()],
+                                    (expected.numpy().reshape(-1) != 0).astype(
+                                        np.uint8
+                                    ),
+                                )
+                            )
+                        for t in dd.k_buffer + dd.v_buffer:
+                            expected = torch.zeros_like(t)
+                            for head in range(16 // dst_tp):
+                                expected[64 : 64 + count, head] = head + 10
+                            self.assertTrue(torch.equal(t, expected))
+                            expected_writes = np.zeros(t.nbytes, dtype=np.uint8)
+                            row_bytes = t[0].nbytes
+                            expected_writes[
+                                64 * row_bytes : (64 + count) * row_bytes
+                            ] = 1
+                            self.assertTrue(
+                                np.array_equal(writes[t.data_ptr()], expected_writes)
+                            )
+
+        # A source without draft can still map into a draft-equipped Decode.
+        for shard in (0, 1):
+            st, dt = target(True, shard), target(False)
+            sd = pool("nhd")
+            sd.start_layer = 0
+            src_ids = get_transfer_kv_layer_ids(st, None, 4)
+            dst_ids = get_transfer_kv_layer_ids(dt, sd, 4)
+            self.assertEqual(
+                mc.resolve_dcp_dst_entry_indices(src_ids, dst_ids, 2, 6),
+                [2 * shard, 2 * shard + 1],
+            )
+
     def test_bootstrap_http_advertises_source_draft_presence(self):
         import asyncio
         import json

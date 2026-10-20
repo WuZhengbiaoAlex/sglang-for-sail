@@ -4136,6 +4136,10 @@ class MLATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_layer_ids(self):
+        """Global layer IDs in the same order as the exported MLA buffers."""
+        return list(range(self.start_layer, self.start_layer + self.layer_num))
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
