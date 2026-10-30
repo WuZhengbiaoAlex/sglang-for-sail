@@ -21,7 +21,7 @@ def _load_flash_kda():
         import flash_kda
     except ImportError as e:
         raise ImportError(
-            "The 'flashkda' KDA prefill backend requires the flash_kda module, "
+            "The 'flashkda' KDA backend requires the flash_kda module, "
             "which is not installed. Install it from source:\n"
             "    pip install git+https://github.com/MoonshotAI/FlashKDA.git"
         ) from e
@@ -76,21 +76,126 @@ def _triton_fallback(
 
 
 class FlashKDAKernel(LinearAttnKernelBase):
-    """FlashKDA (MoonshotAI) fully-fused CUTLASS KDA prefill backend.
+    """FlashKDA fused KDA prefill and PPU dense-chain verify backend.
 
     Wraps the external ``flash_kda`` package (https://github.com/MoonshotAI/FlashKDA).
 
     FlashKDA fuses q/k L2 norm, beta sigmoid, and the KDA gate *inside* the
     kernel, so we pass RAW tensors plus ``A_log``/``dt_bias``/``lower_bound``.
-    It is prefill-only, bf16, K == V == 128, HV == H (no GVA), and requires the
-    safe (bounded) gate (``lower_bound`` set). The non-safe path and sequences
-    outside [chunk_size, max_seq_len] fall back to Triton ``chunk_kda``.
-    Requires an SM90+ GPU with the ``flash_kda`` package.
+    Prefill is bf16, K == V == 128, HV == H (no GVA), and requires the safe
+    (bounded) gate (``lower_bound`` set). Unsupported layouts and snapshot
+    requirements fall back to Triton. PPU verify uses the wheel's strided ABI
+    for dense speculative chains and falls back for tree/ragged layouts.
     """
 
     # Tracked batches always take the Triton fallback, which forwards the
     # fp32 snapshot arguments (see _triton_fallback).
     supports_track_state_snapshot: bool = True
+
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+        lower_bound: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Use the PPU FlashKDA dense-chain verify ABI when rollback is safe."""
+        flash_kda = _load_flash_kda()
+        batch_size = cache_indices.numel()
+        num_heads = q.shape[2]
+        if (
+            q.ndim == 4
+            and a.ndim == 3
+            and a.shape == (q.shape[0], q.shape[1], num_heads * 128)
+        ):
+            a = a.view(q.shape)
+        native = (
+            is_ppu()
+            and hasattr(flash_kda, "verify_strided")
+            and lower_bound is not None
+            and intermediate_states_buffer is not None
+            and retrieve_parent_token is None
+            and not kwargs.get("cache_ring", False)
+            and kwargs.get("native_correction") is None
+            and 0 < batch_size * num_heads <= 768
+            and 0 < cache_steps <= 8
+            and q.shape == k.shape == v.shape == a.shape
+            and q.ndim == 4
+            and q.shape[0] == 1
+            and q.shape[1] == batch_size * cache_steps
+            and q.shape[3] == 128
+            and b.numel() == batch_size * cache_steps * num_heads
+            and q.dtype == k.dtype == v.dtype == a.dtype == torch.bfloat16
+            and b.dtype == torch.bfloat16
+            and ssm_states.dtype in (torch.bfloat16, torch.float32)
+            and intermediate_states_buffer.dtype == ssm_states.dtype
+        )
+        if not native:
+            from sglang.srt.layers.attention.linear.kernels.kda_triton import (
+                TritonKDAKernel,
+            )
+
+            return TritonKDAKernel().target_verify(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
+                retrieve_parent_token=retrieve_parent_token,
+                lower_bound=lower_bound,
+                **kwargs,
+            )
+
+        shape = (batch_size, cache_steps, num_heads, 128)
+        if not getattr(self, "_native_verify_logged", False):
+            import logging
+
+            self._native_verify_logged = True
+            logging.getLogger(__name__).info(
+                "FlashKDA native verify active: H=%s T=%s state=%s",
+                num_heads,
+                cache_steps,
+                ssm_states.dtype,
+            )
+        out = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
+        flash_kda.verify_strided(
+            q.view(shape),
+            k.view(shape),
+            v.view(shape),
+            a.view(shape),
+            b.reshape(batch_size, cache_steps, num_heads).contiguous(),
+            A_log.reshape(-1).float().contiguous(),
+            dt_bias.reshape(num_heads, 128).float().contiguous(),
+            128**-0.5,
+            lower_bound,
+            ssm_states,
+            cache_indices.contiguous(),
+            intermediate_states_buffer,
+            intermediate_state_indices[:batch_size].contiguous(),
+            out,
+        )
+        return out.flatten(0, 1).unsqueeze(0)
 
     def decode(
         self,
@@ -130,11 +235,39 @@ class FlashKDAKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> torch.Tensor:
         # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
-            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+        # radix extra_buffer track path may need; route only batches requiring
+        # an intermediate snapshot through Triton. Aligned-only tracking can
+        # copy the committed final state without an h tensor.
+        track_ssm_h_src = kwargs.get("track_ssm_h_src")
+        final_state_only_track = (
+            return_intermediate_states
+            and track_ssm_h_src is not None
+            and track_ssm_h_src.numel() == 0
+            and kwargs.get("track_state") is None
+        )
+        snapshot_fallback = return_intermediate_states and not final_state_only_track
+        if (
+            q.shape[1] > 1
+            and snapshot_fallback
+            and not getattr(self, "_snapshot_fallback_logged", False)
+        ):
+            import logging
+
+            self._snapshot_fallback_logged = True
+            logging.getLogger(__name__).info(
+                "FlashKDA prefill snapshot fallback: tokens=%s h_rows=%s",
+                q.shape[1],
+                None if track_ssm_h_src is None else track_ssm_h_src.numel(),
+            )
+        unsupported_ppu_layout = is_ppu() and not self._ppu_native_layout_supported(
+            q, k, v, g, beta, ssm_states, cache_indices, query_start_loc, A_log, dt_bias
+        )
+        if (
+            snapshot_fallback
+            or unsupported_ppu_layout
+            or self._should_fall_back(
+                lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+            )
         ):
             return _triton_fallback(
                 q,
@@ -154,13 +287,10 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        # Only reachable when return_intermediate_states is False (the True case
-        # is served by the Triton fallback above), so honor the (out) vs (out, h)
-        # return contract and hand back just the output tensor -- kda_nvidia and
-        # kda_ptx do the same. Wrapping into (out, None) here made non-track
-        # batches (track_ssm=False, which never unpack) receive a tuple and fail
-        # on `.shape` downstream (o_norm / fused_norm_gate).
-        return self._flashkda_extend(
+        # Preserve the (out) vs (out, h) contract: non-tracked batches consume
+        # the output tensor directly, while aligned-only tracked batches unpack
+        # a tuple and copy the final recurrent state instead of an h snapshot.
+        out = self._flashkda_extend(
             q,
             k,
             v,
@@ -173,6 +303,41 @@ class FlashKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
+        )
+        # The radix track needs no intermediate h when every tracked sequence
+        # ends on a KDA chunk boundary; the caller copies the final state.
+        return (out, None) if final_state_only_track else out
+
+    @staticmethod
+    def _ppu_native_layout_supported(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        A_log: Optional[torch.Tensor],
+        dt_bias: Optional[torch.Tensor],
+    ) -> bool:
+        """Keep non-K3 layouts on the existing Triton implementation."""
+        if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
+            return False
+        heads, tokens = q.shape[2], q.shape[1]
+        return (
+            q.shape == k.shape == v.shape == g.shape
+            and q.dtype == k.dtype == v.dtype == g.dtype == torch.bfloat16
+            and beta.shape == (1, tokens, heads)
+            and beta.dtype in (torch.bfloat16, torch.float32)
+            and ssm_states.ndim == 4
+            and ssm_states.shape[1:] == (heads, 128, 128)
+            and ssm_states.dtype == torch.float32
+            and cache_indices.numel() + 1 == query_start_loc.numel()
+            and A_log is not None
+            and A_log.numel() == heads
+            and dt_bias is not None
+            and dt_bias.numel() == heads * 128
         )
 
     @staticmethod
@@ -266,42 +431,31 @@ class FlashKDAKernel(LinearAttnKernelBase):
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
 
-        if is_ppu():
-            from pla.prefill.flashkdapro import flashkda_fwd
+        flash_kda = _load_flash_kda()
+        if q.shape[1] > 1 and not getattr(self, "_native_prefill_logged", False):
+            import logging
 
-            batch_size, seq_len, num_heads, head_dim = q.shape
-            flashkda_fwd(
-                q=q.view(batch_size * seq_len, num_heads, head_dim),
-                k=k.view(batch_size * seq_len, num_heads, head_dim),
-                v=v.view(batch_size * seq_len, num_heads, head_dim),
-                g=g.view(batch_size * seq_len, num_heads, head_dim),
-                beta=beta.view(batch_size * seq_len, num_heads),
-                A_log=A_log,
-                dt_bias=dt_bias,
-                out=out_buf.view(batch_size * seq_len, num_heads, head_dim),
-                scale=scale,
-                lower_bound=lower_bound,
-                initial_state=initial_state,
-                final_state=final_state,
-                cu_seqlens=cu_seqlens,
+            self._native_prefill_logged = True
+            logging.getLogger(__name__).info(
+                "FlashKDA native prefill active: H=%s tokens=%s",
+                num_heads,
+                q.shape[1],
             )
-        else:
-            flash_kda = _load_flash_kda()
-            flash_kda.fwd(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                scale,
-                out_buf,
-                A_log,
-                dt_bias,
-                lower_bound,
-                initial_state=initial_state,
-                final_state=final_state,
-                cu_seqlens=cu_seqlens,
-            )
+        flash_kda.fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            out_buf,
+            A_log,
+            dt_bias,
+            lower_bound,
+            initial_state=initial_state,
+            final_state=final_state,
+            cu_seqlens=cu_seqlens,
+        )
 
         ssm_states[cache_indices] = final_state
 

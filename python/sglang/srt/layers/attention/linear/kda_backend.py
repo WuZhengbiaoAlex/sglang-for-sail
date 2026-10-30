@@ -57,16 +57,17 @@ class KDAKernelDispatcher:
             if (
                 not decode_backend.is_triton()
                 or not (prefill_backend.is_triton() or prefill_backend.is_flashkda())
-                or not verify_backend.is_triton()
+                or not (verify_backend.is_triton() or verify_backend.is_flashkda())
             ):
                 rank0_log(
-                    "PPU KDA only supports fused decode and FlashKDA prefill; "
+                    "PPU KDA supports Triton decode and FlashKDA prefill/verify; "
                     "using Triton for unsupported backends."
                 )
             decode_backend = LinearAttnKernelBackend.TRITON
             if not prefill_backend.is_flashkda():
                 prefill_backend = LinearAttnKernelBackend.TRITON
-            verify_backend = LinearAttnKernelBackend.TRITON
+            if not verify_backend.is_flashkda():
+                verify_backend = LinearAttnKernelBackend.TRITON
 
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
@@ -123,6 +124,12 @@ class KDAKernelDispatcher:
         #   nv_cutedsl: fused Kimi-K3/DSpARK dense verify.
         if verify_backend.is_triton():
             self.verify_kernel = triton_kernel
+        elif verify_backend.is_flashkda():
+            from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+                FlashKDAKernel,
+            )
+
+            self.verify_kernel = FlashKDAKernel()
         elif verify_backend.is_flashinfer():
             if decode_backend.is_flashinfer():
                 self.verify_kernel = self.decode_kernel
@@ -145,7 +152,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA verify backend: {verify_backend}. "
-                "KDA verify supports 'triton', 'nv_cutedsl', or 'flashinfer'."
+                "KDA verify supports 'triton', 'flashkda', 'nv_cutedsl', "
+                "or 'flashinfer'."
             )
 
         if prefill_backend.is_triton():
@@ -319,12 +327,13 @@ class KDAKernelDispatcher:
         """MTP / speculative-decode verify, routed to ``self.verify_kernel``
         (FlashInfer decode -> recurrent_kda; Triton / CuTe DSL decode -> the Triton
         fused KDA verify)."""
-        if lower_bound is not None and not isinstance(
-            self.verify_kernel, TritonKDAKernel
+        if lower_bound is not None and not (
+            isinstance(self.verify_kernel, TritonKDAKernel)
+            or self.verify_backend.is_flashkda()
         ):
             raise NotImplementedError(
-                "lower_bound (safe gate) target verify is only supported by "
-                f"TritonKDAKernel; got {self.verify_kernel.__class__.__name__}."
+                "lower_bound (safe gate) target verify requires Triton or "
+                f"FlashKDA; got {self.verify_kernel.__class__.__name__}."
             )
         return self.verify_kernel.target_verify(
             A_log=A_log,
