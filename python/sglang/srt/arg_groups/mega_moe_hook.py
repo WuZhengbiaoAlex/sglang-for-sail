@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_ppu
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,12 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
+    if is_ppu():
+        from sglang.srt.utils import get_device_sm
+
+        if get_device_sm() < 89:
+            raise ValueError("PPU MegaMoE requires PPU1.5 (ZW-M890P).")
+        return
     if not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip

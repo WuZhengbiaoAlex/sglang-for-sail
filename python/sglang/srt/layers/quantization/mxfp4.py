@@ -890,6 +890,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if _is_ppu and self.use_mega_moe:
+            from sglang.srt.layers.moe.ppu_mega_moe import prepare_weights
+
+            if self.with_bias:
+                raise ValueError("PPU MegaMoE does not support expert bias.")
+            prepare_weights(layer, activation=layer.moe_runner_config.activation)
+            return
+
         if _is_ppu and self.use_deepgemm_mxfp4_w4a16_mma:
             from sglang.srt.layers.quantization.ppu_mxfp4_utils import (
                 preprocess_mxfp4_w4a16_mma_scales,

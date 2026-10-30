@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -153,6 +153,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if is_ppu():
+        return True
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -292,6 +294,19 @@ def run_mega_routed_experts(
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    if is_ppu():
+        from sglang.srt.layers.moe.ppu_mega_moe import forward
+
+        y = forward(
+            experts, hidden_states, topk_ids, topk_weights,
+            hidden_size=hidden_size, intermediate_size=intermediate_size,
+            top_k=top_k, activation=experts.moe_runner_config.activation,
+            activation_clamp=activation_clamp,
+        )
+        if routed_scaling_factor != 1.0:
+            y.mul_(routed_scaling_factor)
+        return y
+
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel

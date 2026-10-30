@@ -772,6 +772,26 @@ class KimiK3MoE(nn.Module):
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
+        if is_ppu():
+            from sglang.srt.layers.moe.ppu_mega_moe import forward
+
+            y = forward(
+                self.experts,
+                routed_input,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                hidden_size=self.moe_hidden_size,
+                intermediate_size=self._mega_intermediate_size,
+                top_k=self._mega_top_k,
+                activation="situ",
+                situ_beta=4.0,
+                situ_linear_beta=25.0,
+            )
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+                if self.routed_scaling_factor is not None and self.routed_scaling_factor != 1.0:
+                    y.mul_(self.routed_scaling_factor)
+            return y
+
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -901,6 +921,11 @@ class KimiK3MoE(nn.Module):
         """Static eligibility for the merged EP front (gate + latent down-proj in
         one GEMM). Requires the two-module merge from _merge_front_weights and the
         same routing contract the single-kernel router needs."""
+        # The merged front currently instantiates a 32-byte FP32 cast vector,
+        # exceeding PPU's AlignedVector limit. Keep the established unmerged
+        # router/latent projection until that optional kernel is PPU-compatible.
+        if is_ppu() and self._use_mega_moe:
+            return False
         return (
             envs.SGLANG_K3_FUSED_FRONT.get()
             and self._front_w is not None
