@@ -40,7 +40,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    is_ppu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -87,6 +94,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -189,12 +197,25 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
-        if quant_config is None:
-            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+        if (
+            _is_ppu
+            and quant_config is not None
+            and isinstance(self.quant_method, UnquantizedLinearMethod)
+        ):
+            from sglang.srt.layers.quantization.ppu_dense import (
+                create_ppu_dense_linear_method,
+            )
+
+            ppu_dense_method = create_ppu_dense_linear_method(prefix)
+            if ppu_dense_method is not None:
+                self.quant_method = ppu_dense_method
 
         if self.quant_method is not None:
             wrap_method_with_debug_kernel_once(

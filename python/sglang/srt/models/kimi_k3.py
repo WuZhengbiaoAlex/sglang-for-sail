@@ -645,13 +645,24 @@ class KimiK3MoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
+            latent_up_prefix = f"{prefix}.routed_expert_up_proj"
             self.routed_expert_up_proj = ReplicatedLinear(
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
                 quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
+                prefix=latent_up_prefix,
             )
+            # This model-specific matrix is outside the checkpoint quantization
+            # config, so apply the selected PPU dense policy explicitly.
+            if is_ppu() and latent_quant_config is None:
+                from sglang.srt.layers.quantization.ppu_dense import (
+                    create_ppu_dense_linear_method,
+                )
+
+                ppu_dense_method = create_ppu_dense_linear_method(latent_up_prefix)
+                if ppu_dense_method is not None:
+                    self.routed_expert_up_proj.quant_method = ppu_dense_method
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -1449,6 +1460,7 @@ class KimiK3MoE(nn.Module):
             if (
                 fused_norm
                 and self._gemm_ag_up_eligible
+                and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
                 return k3_ar_fusion.gemm_ag_up_proj(

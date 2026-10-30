@@ -4,7 +4,7 @@ import json
 import os
 import warnings
 from contextlib import contextmanager
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Any, Callable, Dict, Optional
 
 
@@ -212,6 +212,11 @@ class GateGemvMode(IntEnum):
     OFF = 0
     PAIR = 1
     FUSED = 2
+
+
+class PPUDenseGemmMode(str, Enum):
+    BF16 = "bf16"
+    W8A8 = "w8a8"
 
 
 class ToolStrictLevel(IntEnum):
@@ -1976,6 +1981,9 @@ class Envs:
     SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    # PPU model-owned dense GEMMs. W8A8 is the qualified channel-wise FP8
+    # path; accuracy-sensitive auxiliary projections have fixed BF16 policy.
+    SGLANG_PPU_DENSE_GEMM_MODE = EnvStr(PPUDenseGemmMode.BF16.value)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
@@ -2001,6 +2009,19 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def get_ppu_dense_gemm_mode() -> PPUDenseGemmMode:
+    """Return the selected PPU dense GEMM precision."""
+    raw_value = envs.SGLANG_PPU_DENSE_GEMM_MODE.get()
+    try:
+        return PPUDenseGemmMode(raw_value.strip().lower())
+    except ValueError as exc:
+        choices = ", ".join(item.value for item in PPUDenseGemmMode)
+        raise ValueError(
+            "SGLANG_PPU_DENSE_GEMM_MODE must be one of "
+            f"{choices}, got {raw_value!r}"
+        ) from exc
 
 
 def exportable_env_vars() -> dict[str, str]:
