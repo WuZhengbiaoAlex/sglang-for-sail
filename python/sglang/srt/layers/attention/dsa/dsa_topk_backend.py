@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -129,13 +129,22 @@ class DSATopKBackend(Enum):
         # Expand the per-request page table to per-query rows. Each query block bid
         # belongs to request r where cu_seqlens_q_topk[r] <= bid < cu_seqlens_q_topk[r+1],
         # mirroring topk_transform_prefill_kernel's cu_seqlens_q scan.
-        q_ids = torch.arange(num_q, device=device)
-        req_idx = torch.searchsorted(
-            cu_seqlens_q_topk[1:].contiguous(), q_ids, right=True
-        )
-        page_table_per_query = page_table_size_1.index_select(
-            0, req_idx.to(torch.long)
-        ).contiguous()
+        if (
+            is_ppu()
+            and envs.SGLANG_PPU_DSA_TOPK_BROADCAST_PAGE_TABLE.get()
+            and page_table_size_1.shape[0] == 1
+        ):
+            # The native BF16 kernel uses page_table.stride(0), including zero.
+            # All queries belong to the sole request, so no [Q, KV] copy is needed.
+            page_table_per_query = page_table_size_1.expand(num_q, -1)
+        else:
+            q_ids = torch.arange(num_q, device=device)
+            req_idx = torch.searchsorted(
+                cu_seqlens_q_topk[1:].contiguous(), q_ids, right=True
+            )
+            page_table_per_query = page_table_size_1.index_select(
+                0, req_idx.to(torch.long)
+            ).contiguous()
 
         # Use new_full(-1) so unfilled slots are safe when logits has fewer positions than topk.
         page_indices = logits.new_full((num_q, topk), -1, dtype=torch.int32)
@@ -258,6 +267,13 @@ class DSATopKBackend(Enum):
                 page_table_size_1 = (
                     attn_metadata.page_table_1[batch_idx_list]
                     if batch_idx_list is not None
+                    and not (
+                        is_ppu()
+                        and envs.SGLANG_PPU_DSA_TOPK_BROADCAST_PAGE_TABLE.get()
+                        and envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
+                        and logits.dtype == torch.bfloat16
+                        and attn_metadata.page_table_1.shape[0] == 1
+                    )
                     else attn_metadata.page_table_1
                 )
                 # Route PAGED path through dsv4's bf16 topk kernel when gate is on

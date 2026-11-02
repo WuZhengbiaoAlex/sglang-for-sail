@@ -2006,6 +2006,9 @@ class Envs:
     # Kimi K3.1 eager prefill: distribute replicated indexer query rows over
     # attention TP, then gather only the final physical-slot TopK indices.
     SGLANG_PPU_DSA_INDEXER_TP_SPLIT = EnvBool(True)
+    # The PPU BF16 TopK kernel accepts a zero page-table row stride. Reuse a
+    # single request's mapping instead of materializing it for every query.
+    SGLANG_PPU_DSA_TOPK_BROADCAST_PAGE_TABLE = EnvBool(True)
     # Enable NaN check on logits valid range before topk_transform (debug/diag).
     SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
 
