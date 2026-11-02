@@ -1890,9 +1890,18 @@ class KVCacheConfigurator:
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
             if is_deepseek_dsa(self.model_config.hf_config):
+                from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                    is_fp4_indexer_cache_enabled,
+                )
+
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    use_fp4_indexer=(
+                        current_platform.is_ppu()
+                        and dsa_index_kpool == 1
+                        and is_fp4_indexer_cache_enabled()
+                    ),
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,

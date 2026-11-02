@@ -3900,6 +3900,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -3985,6 +3986,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                use_fp4_indexer=use_fp4_indexer,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
