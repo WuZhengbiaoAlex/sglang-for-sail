@@ -36,6 +36,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
+    is_ppu,
     parse_connector_type,
 )
 
@@ -272,7 +273,7 @@ def handle_linear_attn_backend(server_args: Any):
     # on an explicit --linear-attn-decode-backend flashkda, and fall back to
     # triton decode when it was only inherited from base=flashkda (prefill
     # keeps FlashKDA).
-    if decode == "flashkda":
+    if decode == "flashkda" and not is_ppu():
         if cfg.linear_attn_decode_backend == "flashkda":
             raise ValueError(
                 "--linear-attn-decode-backend flashkda is not supported: "

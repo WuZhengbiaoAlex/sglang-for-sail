@@ -210,9 +210,45 @@ class FlashKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        raise NotImplementedError("FlashKDAKernel only supports prefill (extend)")
+        flash_kda = _load_flash_kda()
+        if not is_ppu() or not hasattr(flash_kda, "decode"):
+            raise NotImplementedError("FlashKDA decode requires the PPU extension")
+        if lower_bound is not None and not getattr(
+            flash_kda, "supports_decode_safe_gate", False
+        ):
+            raise RuntimeError("FlashKDA decode wheel lacks safe-gate support")
+        if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
+            raise ValueError("FlashKDA decode requires [1, batch, heads, 128]")
+        batch, heads = q.shape[1:3]
+        if q.shape != k.shape or q.shape != v.shape or cache_indices.numel() != batch:
+            raise ValueError("FlashKDA decode requires one Q/K/V token per state slot")
+        packed = torch.cat(
+            [x.reshape(batch, heads * 128) for x in (q, k, v)], dim=-1
+        ).contiguous()
+        out = q.new_empty((batch, 1, heads, 128))
+        flash_kda.decode(
+            packed,
+            a.reshape(batch, heads * 128).contiguous(),
+            b.reshape(batch, heads).contiguous(),
+            A_log.reshape(-1).float().contiguous(),
+            dt_bias.reshape(heads, 128).float().contiguous(),
+            128**-0.5,
+            ssm_states,
+            cache_indices.contiguous(),
+            out,
+            lower_bound=lower_bound,
+        )
+        if not getattr(self, "_native_decode_logged", False):
+            import logging
+
+            self._native_decode_logged = True
+            logging.getLogger(__name__).info(
+                "FlashKDA native decode active: H=%s state=%s", heads, ssm_states.dtype
+            )
+        return out.transpose(0, 1)
 
     def extend(
         self,

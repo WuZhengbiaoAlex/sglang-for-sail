@@ -55,20 +55,22 @@ class KDAKernelDispatcher:
     ):
         if is_ppu():
             if (
-                not decode_backend.is_triton()
+                not (decode_backend.is_triton() or decode_backend.is_flashkda())
                 or not (prefill_backend.is_triton() or prefill_backend.is_flashkda())
                 or not (verify_backend.is_triton() or verify_backend.is_flashkda())
             ):
                 rank0_log(
-                    "PPU KDA supports Triton decode and FlashKDA prefill/verify; "
+                    "PPU KDA supports Triton and FlashKDA prefill/decode/verify; "
                     "using Triton for unsupported backends."
                 )
-            decode_backend = LinearAttnKernelBackend.TRITON
+            if not decode_backend.is_flashkda():
+                decode_backend = LinearAttnKernelBackend.TRITON
             if not prefill_backend.is_flashkda():
                 prefill_backend = LinearAttnKernelBackend.TRITON
             if not verify_backend.is_flashkda():
                 verify_backend = LinearAttnKernelBackend.TRITON
 
+        self.decode_backend = decode_backend
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
         self.triton_kernel = triton_kernel
@@ -88,6 +90,12 @@ class KDAKernelDispatcher:
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_flashkda() and is_ppu():
+            from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+                FlashKDAKernel,
+            )
+
+            self.decode_kernel = FlashKDAKernel()
         elif decode_backend.is_helion():
             assert helion_kernel is not None
             self.decode_kernel = helion_kernel
@@ -282,8 +290,9 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
+        if lower_bound is not None and not (
+            isinstance(self.decode_kernel, TritonKDAKernel)
+            or (is_ppu() and self.decode_backend.is_flashkda())
         ):
             raise NotImplementedError(
                 f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
@@ -685,7 +694,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # the output-norm gate for this forward (attempt-and-verify stash,
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
+        if replayssm_d is None and not self.kernel_dispatcher.decode_backend.is_flashkda():
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (

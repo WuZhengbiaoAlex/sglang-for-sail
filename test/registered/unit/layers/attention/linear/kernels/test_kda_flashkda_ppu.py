@@ -15,6 +15,54 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPPUFlashKDA(CustomTestCase):
+    def test_decode_packs_qkv_and_forwards_raw_gate_and_safe_bound(self):
+        kernel = kda_flashkda.FlashKDAKernel()
+        q = torch.ones((1, 2, 6, 128), dtype=torch.bfloat16)
+        k, v = q * 2, q * 3
+        a = torch.full((1, 2, 768), 4, dtype=torch.bfloat16)
+        b = torch.full((1, 2, 6), 5, dtype=torch.bfloat16)
+        states = torch.zeros((3, 6, 128, 128))
+        slots = torch.tensor([1, 0], dtype=torch.int32)
+        calls = []
+
+        def decode(*args, **kwargs):
+            calls.append((args, kwargs))
+            args[-1].fill_(7)
+
+        module = types.SimpleNamespace(decode=decode, supports_decode_safe_gate=True)
+        with patch.object(kda_flashkda, "is_ppu", return_value=True), patch.object(
+            kda_flashkda, "_load_flash_kda", return_value=module
+        ):
+            out = kernel.decode(
+                q, k, v, a, b,
+                A_log=torch.zeros(6), dt_bias=torch.zeros(768),
+                ssm_states=states, cache_indices=slots,
+                query_start_loc=torch.arange(3), lower_bound=-5.0,
+            )
+        self.assertEqual(out.shape, q.shape)
+        self.assertTrue(torch.all(out == 7))
+        args, kwargs = calls[0]
+        torch.testing.assert_close(args[0], torch.cat([x.reshape(2, 768) for x in (q, k, v)], -1))
+        torch.testing.assert_close(args[1], a.reshape(2, 768))
+        torch.testing.assert_close(args[2], b.reshape(2, 6))
+        self.assertIs(args[6], states)
+        torch.testing.assert_close(args[7], slots)
+        self.assertEqual(kwargs["lower_bound"], -5.0)
+
+    def test_decode_safe_gate_rejects_an_old_wheel(self):
+        module = types.SimpleNamespace(decode=lambda *args: None)
+        q = torch.zeros((1, 1, 6, 128), dtype=torch.bfloat16)
+        with patch.object(kda_flashkda, "is_ppu", return_value=True), patch.object(
+            kda_flashkda, "_load_flash_kda", return_value=module
+        ), self.assertRaisesRegex(RuntimeError, "safe-gate"):
+            kda_flashkda.FlashKDAKernel().decode(
+                q, q, q, q.flatten(2), torch.zeros(1, 1, 6),
+                A_log=torch.zeros(6), dt_bias=torch.zeros(768),
+                ssm_states=torch.zeros(2, 6, 128, 128),
+                cache_indices=torch.tensor([0]), query_start_loc=torch.arange(2),
+                lower_bound=-5.0,
+            )
+
     def test_unsupported_ppu_prefill_layout_uses_triton(self):
         kernel = kda_flashkda.FlashKDAKernel()
         q = torch.zeros((1, 64, 6, 64), dtype=torch.bfloat16)
