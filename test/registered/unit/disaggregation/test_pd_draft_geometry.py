@@ -354,6 +354,42 @@ class TestPDDraftGeometry(CustomTestCase):
         mgr.prepare_dcp_entry_geometry(info)
         self.assertEqual(info.dcp_token_item_lens, [6])
 
+    def test_registration_with_staging_slot_field_and_draft_geometry(self):
+        msg = [
+            b"None",
+            b"host",
+            b"1",
+            b"s",
+            struct.pack("2Q", 20, 30),
+            b"",
+            b"",
+            b"0",
+            b"8",
+            b"24",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"0",
+            b"",  # v0.5.21 staging slot layer IDs
+            struct.pack("2Q", 24, 192),
+            b"2",
+            b"1",
+            b"16",
+            b"4",
+            b"1",
+        ]
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_kv_item_lens, [24, 192])
+        self.assertEqual(info.dst_draft_entry_count, 2)
+        self.assertEqual(info.dst_draft_head_num, 1)
+        self.assertEqual(info.dst_draft_total_head_num, 16)
+        self.assertEqual(info.dst_page_size, 4)
+        self.assertTrue(info.dst_draft_token_major)
+
     def test_layer_ids_disambiguate_draft_and_target(self):
         from sglang.srt.disaggregation.utils import get_transfer_kv_layer_ids
 

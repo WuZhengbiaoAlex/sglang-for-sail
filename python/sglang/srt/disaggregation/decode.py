@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
+    get_draft_total_num_kv_heads,
     get_kv_class,
     get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
@@ -624,6 +625,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
+        draft_kv_entry_count = 0
         if self.draft_token_to_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.

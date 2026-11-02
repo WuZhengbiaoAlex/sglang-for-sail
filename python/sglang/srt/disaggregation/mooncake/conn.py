@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -72,6 +72,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.server_args import ServerArgs
@@ -157,13 +158,26 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
-    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_kv_item_lens: Optional[List[int]] = None
+    dst_draft_entry_count: int = 0
+    dst_draft_head_num: int = 0
+    dst_draft_total_head_num: int = 0
+    dst_draft_token_major: bool = False
+    dst_page_size: Optional[int] = None
+    dcp_dst_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        # v0.5.21 reserves field 18 for staging slot layer IDs. The PR's
+        # v0.5.18 wire format did not have that field; accept both layouts.
+        legacy_pr_layout = 23 <= len(msg) <= 24
+        if not legacy_pr_layout and len(msg) > 18 and len(msg[18]) % 8:
+            raise struct.error("Invalid staging slot layer ID payload")
+        geometry_idx = 18 if legacy_pr_layout else 19
+        extension_idx = geometry_idx + 1
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -206,12 +220,33 @@ class KVArgsRegisterInfo:
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
             dst_kv_item_lens=(
-                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
-                if len(msg) > 19 and msg[19]
-                else []
+                list(
+                    struct.unpack(f"{len(msg[geometry_idx]) // 8}Q", msg[geometry_idx])
+                )
+                if len(msg) > geometry_idx and msg[geometry_idx]
+                else None
+            ),
+            dst_draft_entry_count=(
+                int(msg[extension_idx]) if len(msg) > extension_idx else 0
+            ),
+            dst_draft_head_num=(
+                int(msg[extension_idx + 1]) if len(msg) > extension_idx + 1 else 0
+            ),
+            dst_draft_total_head_num=(
+                int(msg[extension_idx + 2]) if len(msg) > extension_idx + 2 else 0
+            ),
+            dst_page_size=(
+                int(msg[extension_idx + 3]) if len(msg) > extension_idx + 3 else None
+            ),
+            dst_draft_token_major=(
+                msg[extension_idx + 4] == b"1"
+                if len(msg) > extension_idx + 4
+                else False
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            staging=StagingRegisterInfo.from_zmq_fields(
+                msg, 14, slot_ids_index=None if legacy_pr_layout else 18
+            ),
         )
 
 
@@ -2705,6 +2740,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if self._requires_dcp_entry_geometry(info):
                 self.prepare_dcp_entry_geometry(info)
+            if info.requires_dcp_relayout:
+                self._init_dcp_pack_buffers_once(info.dst_dcp_size, include_draft=True)
         except (
             ValueError,
             RuntimeError,
@@ -2830,35 +2867,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     logger.exception("Malformed bootstrap message without a session ID")
                     continue
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
-                            )
-                        )
-                        self._init_dcp_pack_buffers_once(
-                            decode_kv_args.dst_dcp_size, include_draft=True
-                        )
-                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
-                    with self.session_lock:
-                        if mooncake_session_id in self.failed_sessions:
-                            self.failed_sessions.remove(mooncake_session_id)
-                        if mooncake_session_id in self.session_failures:
-                            del self.session_failures[mooncake_session_id]
-                    logger.debug(
-                        f"Register KVArgs from {mooncake_session_id} successfully"
-                    )
+                    self._register_decode_peer(waiting_req_bytes, mooncake_session_id)
                     continue
                 else:
                     if mooncake_session_id in self.rejected_registrations:
@@ -3336,6 +3345,15 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            str(self.kv_mgr.kv_args.draft_kv_entry_count).encode(
+                                "ascii"
+                            ),
+                            str(self.kv_mgr.kv_args.draft_kv_head_num).encode("ascii"),
+                            str(self.kv_mgr.kv_args.draft_total_kv_head_num).encode(
+                                "ascii"
+                            ),
+                            str(self.kv_mgr.kv_args.page_size).encode("ascii"),
+                            b"1" if self.kv_mgr.kv_args.draft_kv_token_major else b"0",
                         ]
                     )
             except zmq.ZMQError:
