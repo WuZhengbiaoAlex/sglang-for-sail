@@ -517,7 +517,21 @@ class DeepseekSparseAttnBackend(
         # construction: an unsupported config must fail at launch rather than
         # mid-forward. `flashmla_sparse` remains the bf16 path with no such
         # requirement.
-        if self.dsa_prefill_impl == "flashmla_sparse_q8":
+        if _is_ppu and "flashmla_sparse_q8" in (
+            self.dsa_prefill_impl, self.dsa_decode_impl
+        ):
+            if self.kv_cache_dtype != torch.bfloat16:
+                raise ValueError(
+                    "PPU flashmla_sparse_q8 currently requires a BF16 persistent KV cache"
+                )
+            from flash_mla import (
+                flash_mla_sparse_quantized_fwd,
+                flash_mla_sparse_quantized_decode_fwd,
+            )
+
+            self._ppu_q8_prefill = flash_mla_sparse_quantized_fwd
+            self._ppu_q8_decode = flash_mla_sparse_quantized_decode_fwd
+        elif self.dsa_prefill_impl == "flashmla_sparse_q8":
             if self.kv_cache_dtype != torch.float8_e4m3fn:
                 raise ValueError(
                     "--dsa-prefill-backend flashmla_sparse_q8 is native FP8 and requires "
@@ -533,7 +547,7 @@ class DeepseekSparseAttnBackend(
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
         # via the shared CLI choices.
-        if self.dsa_decode_impl == "flashmla_sparse_q8":
+        if self.dsa_decode_impl == "flashmla_sparse_q8" and not _is_ppu:
             raise ValueError(
                 "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
                 "flashmla_sparse_q8 is a prefill-only backend. For FP8, use "
@@ -2234,7 +2248,7 @@ class DeepseekSparseAttnBackend(
                 # directly (fusing the concat with the bf16->fp8 cast), so no bf16
                 # q_all is materialized on this path. The prefix path hands over the
                 # paged fp8 KV as-is; the non-prefix path passes the gathered bf16 KV.
-                if dsa_impl == "flashmla_sparse_q8":
+                if dsa_impl == "flashmla_sparse_q8" and not _is_ppu:
                     if _has_prefix:
                         page_table_1_flattened = (
                             self.forward_metadata.page_table_1_flattened
@@ -2296,6 +2310,14 @@ class DeepseekSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if _is_ppu:
+                if dsa_impl == "flashmla_sparse_q8":
+                    return self._forward_ppu_flashmla_sparse_q8(
+                        q_all=q_all,
+                        kv_cache=kv_cache,
+                        page_table_1=page_table_1,
+                        sm_scale=layer.scaling,
+                        v_head_dim=layer.v_head_dim,
+                    )
                 return self._forward_flashmla_sparse(
                     q_all=q_all,
                     kv_cache=kv_cache,
@@ -2479,7 +2501,19 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if dsa_impl == "flashmla_sparse":
+        if dsa_impl == "flashmla_sparse_q8" and _is_ppu:
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_ppu_flashmla_sparse_q8(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                decode=True,
+                attn_sink=attn_sink,
+            )
+        elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -2713,6 +2747,48 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def _forward_ppu_flashmla_sparse_q8(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        decode: bool = False,
+        attn_sink: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # The 1101 native API masks partial head tiles internally, including
+        # K3.1's six heads per TP16 rank. Keep the persistent cache BF16.
+        num_tokens, num_heads, head_dim = q_all.shape
+        topk = page_table_1.shape[-1]
+        if topk % 64:
+            padding = page_table_1.new_full(
+                (page_table_1.shape[0], 64 - topk % 64), -1
+            )
+            page_table_1 = torch.cat((page_table_1, padding), dim=-1)
+        if kv_cache.ndim == 2:
+            kv_cache = kv_cache.unsqueeze(1)
+        if decode:
+            output, _ = self._ppu_q8_decode(
+                q=q_all,
+                kv=kv_cache.to(torch.float8_e4m3fn),
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=attn_sink,
+            )
+            return output
+        output, _, _ = self._ppu_q8_prefill(
+            q=q_all,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            attn_sink=attn_sink,
+            compute_aux=False,
+        )
+        return output[:, :num_heads]
+
     def q8kv8_born_fp8_q_eligible(
         self, forward_batch: ForwardBatch, num_heads: int
     ) -> bool:
@@ -2724,7 +2800,7 @@ class DeepseekSparseAttnBackend(
         a real attention kernel (loud NaNs, not silent corruption, but still a
         failed forward).
         """
-        if self.dsa_prefill_impl != "flashmla_sparse_q8":
+        if _is_ppu or self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
         # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
         # target-verify and draft-extend, which use dsa_decode_impl anyway).
