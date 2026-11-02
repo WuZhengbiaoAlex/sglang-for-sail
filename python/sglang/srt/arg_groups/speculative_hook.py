@@ -1024,6 +1024,36 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch == "KimiK31ForConditionalGeneration":
+        if cfg.speculative_draft_model_path in (None, cfg.model_path):
+            raise ValueError(
+                "Kimi K3.1 MTP requires an external --speculative-draft-model-path"
+            )
+        if cfg.speculative_eagle_topk not in (None, 1):
+            raise ValueError(
+                "Kimi K3.1 fixed-hidden MTP requires --speculative-eagle-topk 1"
+            )
+        if cfg.speculative_token_map is not None:
+            raise ValueError("Kimi K3.1 MTP uses its own full-vocabulary head")
+        defaults = {}
+        if cfg.speculative_num_steps is None:
+            defaults["speculative_num_steps"] = 3
+        if cfg.speculative_eagle_topk is None:
+            defaults["speculative_eagle_topk"] = 1
+        if cfg.speculative_num_draft_tokens is None:
+            defaults["speculative_num_draft_tokens"] = (
+                defaults.get("speculative_num_steps", cfg.speculative_num_steps) + 1
+            )
+        elif cfg.speculative_num_draft_tokens != (
+            defaults.get("speculative_num_steps", cfg.speculative_num_steps) + 1
+        ):
+            raise ValueError(
+                "Kimi K3.1 MTP verification width must equal draft steps + 1"
+            )
+        if cfg.speculative_draft_attention_backend is None:
+            defaults["speculative_draft_attention_backend"] = "flashmla"
+        if defaults:
+            declare_resolution(server_args, "_handle_eagle_family.kimi_k31", **defaults)
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

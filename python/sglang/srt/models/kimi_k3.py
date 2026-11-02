@@ -2756,13 +2756,21 @@ class KimiK3DecoderLayer(nn.Module):
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
         if num_real != num_padded:
-            with k3_sp_collective.o_proj_output_rows(num_padded):
-                attn_out = self._run_self_attn_inner(
-                    hidden_states[:num_real],
-                    positions[:num_real],
-                    forward_batch,
-                    zero_allocator,
-                )
+            # KV scatter launches one row per cache location. Trim its input
+            # together with Q/K; otherwise the dense MLA draft can read past
+            # the last real K row on non-TP-aligned prefill chunks.
+            padded_cache_loc = forward_batch.out_cache_loc
+            forward_batch.out_cache_loc = padded_cache_loc[:num_real]
+            try:
+                with k3_sp_collective.o_proj_output_rows(num_padded):
+                    attn_out = self._run_self_attn_inner(
+                        hidden_states[:num_real],
+                        positions[:num_real],
+                        forward_batch,
+                        zero_allocator,
+                    )
+            finally:
+                forward_batch.out_cache_loc = padded_cache_loc
             padded_o_proj = k3_sp_collective.finish_padded_o_proj_output(
                 attn_out, num_padded
             )
