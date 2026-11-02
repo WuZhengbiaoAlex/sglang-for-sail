@@ -159,6 +159,15 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _is_kimi_k31_indexer_config(config) -> bool:
+    # Indexer receives the normalized text config (model_type=kimi_linear),
+    # not necessarily the outer multimodal config (model_type=kimi_k31).
+    return config is not None and (
+        getattr(config, "model_type", None) == "kimi_k31"
+        or "KimiK31LinearForCausalLM" in (getattr(config, "architectures", None) or [])
+    )
+
+
 if _is_cuda or _is_hip:
     # Plain-torch graph helpers: usable wherever the split-op surface is.
     from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -534,6 +543,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._fused_fp8_sin_cache = None
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
+        self.tp_split_min_rows = (
+            1024
+            if is_ppu()
+            and _is_kimi_k31_indexer_config(config)
+            and envs.SGLANG_PPU_DSA_INDEXER_TP_SPLIT.get()
+            else None
+        )
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -1777,8 +1793,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        tp_split = self._indexer_tp_split(forward_batch, q_offset)
+        row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
-            num_rows=q_offset,
+            num_rows=row_hi - row_lo,
             num_cols=k_offset,
             get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
             rocm=_is_hip,
@@ -1790,7 +1808,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 return (q_packed[start:end], q_sf[start:end])
             return q_fp8[start:end]
 
-        if not need_chunk:
+        if not need_chunk and tp_split is None:
             q_first = _slice_q(0, q_offset)
             q_first_rows = q_first[0].shape[0] if self.use_fp4 else q_first.shape[0]
             assert q_first_rows != 0
@@ -1865,9 +1883,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
             )
 
-        start = 0
-        while start < q_offset:
-            end = min(start + max_rows, q_offset)
+        dst, dst_base = topk_result, 0
+        if tp_split is not None:
+            if not need_chunk:
+                max_rows = row_hi - row_lo
+            dst = torch.empty(
+                (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
+            )
+            dst_base = row_lo
+
+        start = row_lo
+        while start < row_hi:
+            end = min(start + max_rows, row_hi)
             q_chunk = _slice_q(start, end)
 
             with self._with_real_sm_count():
@@ -1940,10 +1967,75 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
-            topk_result[start:end] = raw_topk_chunk
+            dst[start - dst_base : end - dst_base] = raw_topk_chunk
             start = end
 
+        if tp_split is not None:
+            group, _, _, sizes = tp_split
+            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
+
+    def _indexer_tp_split(
+        self, forward_batch: ForwardBatch, q_offset: int
+    ) -> Optional[Tuple[Any, int, int, List[int]]]:
+        # Gate only on group-uniform batch/config state; rank-local free-memory
+        # estimates must never decide whether to enter this collective.
+        if self.tp_split_min_rows is None:
+            return None
+        if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
+            return None
+        if get_parallel().attn_dcp_size > 1:
+            return None
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            return None
+        group = get_parallel().attn_tp_group
+        tp = group.world_size
+        if (
+            tp <= 1
+            or q_offset < max(tp, self.tp_split_min_rows)
+            or group.pynccl_comm is None
+            or not group.pynccl_comm.available
+        ):
+            return None
+        bounds = self._indexer_tp_split_bounds(
+            forward_batch.seq_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+            q_offset,
+            tp,
+        )
+        rank = group.rank_in_group
+        sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
+        logger.info_once(
+            "PPU Kimi K3.1 indexer prefill TP row split enabled (tp=%d)", tp
+        )
+        return group, bounds[rank], bounds[rank + 1], sizes
+
+    @staticmethod
+    def _indexer_tp_split_bounds(
+        seq_lens_cpu: torch.Tensor, extend_lens: List[int], q_offset: int, tp: int
+    ) -> List[int]:
+        """Contiguous query shards balanced by causal KV length (host-only)."""
+        if tp < 1 or q_offset < tp:
+            raise ValueError("Indexer TP split requires at least one row per rank")
+        seq = seq_lens_cpu.to(torch.int64)
+        if (
+            len(extend_lens) == seq.numel()
+            and sum(extend_lens) == q_offset
+            and min(extend_lens, default=0) >= 0
+        ):
+            ext = torch.tensor(extend_lens, dtype=torch.int64)
+            row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
+            row_pos = torch.arange(q_offset, dtype=torch.int64) - row_req_start
+            row_kv = torch.repeat_interleave(seq - ext, ext) + row_pos + 1
+            cum = torch.cumsum(row_kv.clamp_(min=1), 0)
+            targets = cum[-1] * torch.arange(1, tp, dtype=torch.int64) // tp
+            cuts = torch.searchsorted(cum, targets, right=True).tolist()
+        else:
+            cuts = [q_offset * r // tp for r in range(1, tp)]
+        bounds = [0]
+        for r, cut in enumerate(cuts, start=1):
+            bounds.append(min(max(cut, bounds[-1] + 1), q_offset - (tp - r)))
+        return bounds + [q_offset]
 
     def _forward_cuda_k_only(
         self,
