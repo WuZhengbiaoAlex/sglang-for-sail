@@ -96,6 +96,14 @@ class KimiK3Config(PretrainedConfig):
         else:
             self.text_config = text_config
 
+        if self.text_config.num_nextn_predict_layers:
+            # Preserve checkpoint numbering before debug layer-count overrides
+            # are applied by get_config(). The external MTP export uses layer 93.
+            if not hasattr(self.text_config, "mtp_checkpoint_layer"):
+                self.text_config.mtp_checkpoint_layer = (
+                    self.text_config.num_hidden_layers
+                )
+
         if vision_config is None:
             self.vision_config = KimiK3VisionConfig()
         elif isinstance(vision_config, dict):
@@ -122,3 +130,54 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+
+class KimiK31Config(KimiK3Config):
+    model_type = "kimi_k31"
+    has_no_defaults_at_init = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        text = self.text_config
+        dsa = getattr(text, "dsa_config", None)
+        if not isinstance(dsa, dict):
+            raise ValueError("Kimi-K3.1 requires text_config.dsa_config")
+        # The checkpoint nests DSA under text_config; the attention backend,
+        # cache builder and PD metadata also consult the outer HF config.
+        normalized = {
+            "index_topk": dsa["index_topk"],
+            "index_head_dim": dsa["index_head_dim"],
+            "index_n_heads": dsa["index_num_heads"],
+            "index_rope_dim": dsa.get("index_rope_dim", 0),
+            "index_k_norm_type": dsa.get("index_k_norm_type", "layernorm"),
+            "index_topk_freq": dsa.get("index_topk_freq", 1),
+            "index_skip_topk_offset": dsa.get("index_skip_topk_offset", 1),
+        }
+        for name, value in normalized.items():
+            setattr(self, name, value)
+            setattr(text, name, value)
+        text.architectures = ["KimiK31LinearForCausalLM"]
+        self.architectures = ["KimiK31ForConditionalGeneration"]
+
+
+def map_kimi_k31_mtp_weight_name(name: str, checkpoint_layer: int) -> str | None:
+    prefix = f"language_model.model.layers.{checkpoint_layer}."
+    if not name.startswith(prefix):
+        raise ValueError(f"Unexpected tensor in Kimi MTP draft-only export: {name}")
+    name = name[len(prefix) :]
+    # The export's nonexpert-provenance.json documents these fallback keys
+    # as ignored by the reference strict loader.
+    if name in {
+        "self_attention_res_norm.weight",
+        "self_attention_res_proj.weight",
+        "mlp_res_norm.weight",
+        "mlp_res_proj.weight",
+    }:
+        return None
+    if name.startswith("shared_head.head."):
+        return name.replace("shared_head.head.", "lm_head.", 1)
+    if name.startswith(
+        ("embed_tokens.", "eh_proj.", "enorm.", "hnorm.", "shared_head.norm.")
+    ):
+        return "model." + name
+    return "model.layers.0." + name.replace("block_sparse_moe.", "mlp.", 1)

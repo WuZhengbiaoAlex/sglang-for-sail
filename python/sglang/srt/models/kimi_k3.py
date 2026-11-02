@@ -799,7 +799,10 @@ class KimiK3MoE(nn.Module):
                 situ_linear_beta=25.0,
             )
             if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                if self.routed_scaling_factor is not None and self.routed_scaling_factor != 1.0:
+                if (
+                    self.routed_scaling_factor is not None
+                    and self.routed_scaling_factor != 1.0
+                ):
                     y.mul_(self.routed_scaling_factor)
             return y
 
@@ -2335,6 +2338,16 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        if self.use_dsa:
+            dsa_layers = config.dsa_config["dsa_layers"]
+            if layer_idx + 1 not in dsa_layers:
+                raise ValueError(f"MLA layer {layer_idx + 1} has no K3.1 DSA config")
+            if config.index_topk_freq != 1:
+                raise ValueError("K3.1 cross-layer index reuse is not implemented")
+            # KDA layers separate successive DSA layers. No index carry is
+            # needed when every DSA layer computes a fresh top-k.
+            self.skip_topk = False
+            self.next_skip_topk = None
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
@@ -3658,6 +3671,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
+    language_model_class = KimiK3LinearForCausalLM
     supports_cuda_vmm_feature_transport = True
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
@@ -3746,7 +3760,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 if (is_ppu() or uses_wrapper_quant_prefix)
                 else prefix
             )
-            self.language_model = KimiK3LinearForCausalLM(
+            self.language_model = self.language_model_class(
                 config.text_config,
                 quant_config,
                 prefix=language_prefix,
@@ -4109,4 +4123,36 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+class KimiK31LinearForCausalLM(KimiK3LinearForCausalLM):
+    def load_weights(self, weights):
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        loaded = super().load_weights(weights)
+        missing = expected - loaded
+        if missing:
+            raise ValueError(
+                f"Missing Kimi K3.1 DSA indexer weights: {sorted(missing)}"
+            )
+        rank0_log(f"Loaded Kimi K3.1 DSA indexer tensors: {len(expected)}")
+        return loaded
+
+
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """K3.1 uses the K3 backbone with a DSA indexer on each MLA layer."""
+
+    language_model_class = KimiK31LinearForCausalLM
+
+    def get_embed_and_head(self):
+        return (
+            self.language_model.model.embed_tokens.weight,
+            self.language_model.lm_head.weight,
+        )
+
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+    KimiK31ForConditionalGeneration,
+    KimiK31LinearForCausalLM,
+]

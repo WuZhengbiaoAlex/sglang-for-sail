@@ -192,6 +192,8 @@ def is_deepseek_dsa(config) -> bool:
         in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "KimiK31ForConditionalGeneration",
+            "KimiK31LinearForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -222,6 +224,8 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+        "KimiK31ForConditionalGeneration",
+        "KimiK31LinearForCausalLM",
     )
 
 
@@ -850,6 +854,26 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        if is_draft_model and _hf_arch(self.hf_config) in (
+            "KimiK3ForConditionalGeneration",
+            "KimiK31ForConditionalGeneration",
+        ):
+            text = self.hf_text_config
+            if text.num_nextn_predict_layers != 1:
+                raise ValueError("Kimi K3.1 MTP requires a single NextN layer")
+            text.mtp_checkpoint_layer = getattr(
+                text, "mtp_checkpoint_layer", text.num_hidden_layers
+            )
+            text.num_hidden_layers = 1
+            text.architectures = ["KimiK31ForCausalLMNextN"]
+            text.linear_attn_config = None
+            text.first_k_dense_replace = 0
+            # The reference MTP loader ignores the four residual scoring
+            # weights; the draft block uses ordinary residual additions.
+            text.attn_res_block_size = None
+            self.hf_config = text
+            self.is_lm_only = True
+
         from sglang.srt.configs.dots3 import Dots3Config
 
         if is_draft_model and isinstance(self.hf_text_config, Dots3Config):
@@ -1278,6 +1302,9 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31LinearForCausalLM" in self.hf_config.architectures
+            or "KimiK31ForCausalLMNextN" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1286,6 +1313,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only

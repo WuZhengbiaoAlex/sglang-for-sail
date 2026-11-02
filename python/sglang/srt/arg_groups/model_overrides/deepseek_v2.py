@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",

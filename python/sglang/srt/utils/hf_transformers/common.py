@@ -20,7 +20,6 @@ from typing import Any, Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
-
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
@@ -59,6 +58,7 @@ from sglang.srt.configs import (
     K2HorizonConfig,
     KimiK3Config,
     KimiK25Config,
+    KimiK31Config,
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
@@ -136,6 +136,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MuseGlimmerConfig,
         MuseGlimmerAssistantConfig,
         KimiK3Config,
+        KimiK31Config,
         Glm5NextConfig,
         Glm5NextTextConfig,
         KimiLinearConfig,

@@ -214,6 +214,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -235,6 +236,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in [
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "KimiK31ForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",

@@ -48,9 +48,16 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
         )
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if hf_config.architectures[0] == "KimiK31ForConditionalGeneration":
+        # K3.1's MLA layers use the DSA backend, not the dense K3 defaults.
+        if cfg.dcp_size > 1:
+            raise ValueError(
+                "Kimi-K3.1 DSA does not yet support decode context parallelism"
+            )
+        return {}
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:
@@ -184,7 +191,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode

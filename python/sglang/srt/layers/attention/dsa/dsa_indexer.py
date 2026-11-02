@@ -419,6 +419,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
+            and rope_head_dim > 0
         )
         index_k_uses_rmsnorm = (
             config is not None
@@ -495,14 +496,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     else (torch.bfloat16 if _use_aiter else torch.float32)
                 ),
             )
-        self.rotary_emb = get_rope_wrapper(
-            rope_head_dim,
-            rotary_dim=rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,  # type: ignore
-            rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
-            device=get_device().device,
+        self.rotary_emb = (
+            None
+            if rope_head_dim == 0
+            else get_rope_wrapper(
+                rope_head_dim,
+                rotary_dim=rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,  # type: ignore
+                rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
+                device=get_device().device,
+            )
         )
         if self.use_aiter_fused_fp8_writer and not (
             hasattr(self.rotary_emb, "cos_cache")
@@ -995,10 +1000,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-
-        self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        if self.rotary_emb is not None:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+            self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -1051,8 +1056,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dummy_q_rope = torch.empty_like(k_rope)
         else:
             dummy_q_rope = k_rope
-        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        if self.rotary_emb is not None:
+            _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
+            self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         if apply_hadamard:
             key = rotate_activation(key)
 
