@@ -288,6 +288,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.rejected_registrations: Dict[str, str] = {}
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.

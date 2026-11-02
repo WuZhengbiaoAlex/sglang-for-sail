@@ -103,6 +103,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    draft_kv_entry_count: Optional[int] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -2196,6 +2197,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        if self.draft_kv_entry_count is None and "draft_kv_entry_count" in data:
+            self.draft_kv_entry_count = int(data["draft_kv_entry_count"])
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
