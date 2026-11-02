@@ -2222,19 +2222,8 @@ class DeepseekSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
-            # PPU and dpsk opensource mla need head_num padding here
-            # sglang community uses https://github.com/sgl-project/FlashMLA/, not needing
-            if _is_ppu:
-                if layer.tp_q_head_num % self.flashmla_padding != 0:
-                    assert self.flashmla_padding % layer.tp_q_head_num == 0
-                    print_info_once(
-                        f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
-                    )
-                    q_padded = q_all.new_empty(
-                        (q_all.shape[0], self.flashmla_padding, q_all.shape[2])
-                    )
-                    q_padded[:, : layer.tp_q_head_num, :] = q_all
-                    q_all = q_padded
+            # _forward_flashmla_sparse owns padding for both prefill and
+            # decode, including K3.1's non-power-of-two local head counts.
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
@@ -2656,10 +2645,12 @@ class DeepseekSparseAttnBackend(
         need_padding = num_heads % required_padding != 0
 
         if need_padding:
-            assert required_padding % num_heads == 0, (
-                f"num_heads {num_heads} cannot be padded to {required_padding}. "
-                f"TP size may be too large for this model."
-            )
+            # K3.1 has 96 heads (six per rank at TP16). Dummy heads do
+            # not participate in the returned output, so divisibility by
+            # the kernel tile is unnecessary; round up to a complete tile.
+            required_padding = (
+                (num_heads + required_padding - 1) // required_padding
+            ) * required_padding
 
             # Pad q to required size
             q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
