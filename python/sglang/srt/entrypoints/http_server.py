@@ -2196,6 +2196,7 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
+        or "KimiK31ForConditionalGeneration" in architectures
         or model_info.get("model_type") == "kimi_k3"
     ):
         logger.info(

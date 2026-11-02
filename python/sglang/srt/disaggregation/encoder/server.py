@@ -525,7 +525,7 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
     }
-    if model_type == "kimi_k3":
+    if model_type in ("kimi_k3", "kimi_k31"):
         aux["original_image_sizes"] = _normalize_aux_value(
             mm_inputs.get("original_image_sizes")
         )
@@ -1069,7 +1069,7 @@ class MMEncoder:
             return selected
 
         split_kimi_k3_images = (
-            self.model_type == "kimi_k3" and modality == Modality.IMAGE
+            self.model_type in ("kimi_k3", "kimi_k31") and modality == Modality.IMAGE
         )
 
         if modality == Modality.AUDIO:

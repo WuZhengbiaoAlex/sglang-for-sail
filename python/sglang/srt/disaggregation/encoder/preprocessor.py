@@ -694,7 +694,7 @@ class EncoderPreprocessor:
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
         images = await self._flatten_and_load_images(mm_items)
-        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
+        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
@@ -723,7 +723,7 @@ class EncoderPreprocessor:
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
         )
-        if self.model_type == "kimi_k3":
+        if self.model_type in ("kimi_k3", "kimi_k31"):
             processor_input["original_image_sizes"] = original_image_sizes
         return processor_input
 
@@ -848,7 +848,7 @@ class EncoderPreprocessor:
         if modality == Modality.IMAGE:
             # Kimi K2.5/K3 emit grid_thws, while Kimi-VL emits image_grid_hws.
             # Other model types keep the generic attr order above.
-            if model_type in ("kimi_k25", "kimi_k3"):
+            if model_type in ("kimi_k25", "kimi_k3", "kimi_k31"):
                 attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
             elif model_type == "kimi_vl":
                 attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
@@ -905,7 +905,7 @@ class EncoderPreprocessor:
             return self._get_feat_extract_output_lengths(input_length)
         else:
             if (
-                self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
+                self.model_type in ["kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl"]
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
@@ -1009,7 +1009,7 @@ class EncoderPreprocessor:
         a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids.
         """
         if (
-            self.model_type not in ("kimi_k25", "kimi_k3", "kimi_vl")
+            self.model_type not in ("kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl")
             or modality != Modality.IMAGE
         ):
             return [1] * len(leaves)

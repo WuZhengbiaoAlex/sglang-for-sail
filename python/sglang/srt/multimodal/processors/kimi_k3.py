@@ -16,23 +16,23 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 from PIL import Image
-
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+)
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
+    to_chw_uint8,
 )
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
-)
-from sglang.srt.multimodal.kimi_k3_image_processing import (
-    to_chw_uint8,
 )
 from sglang.srt.multimodal.media_artifacts import (
     MediaArtifactCacheMixin,
@@ -368,7 +368,7 @@ class KimiK3ImageProcessor(
     MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
-    models = [KimiK3ForConditionalGeneration]
+    models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3

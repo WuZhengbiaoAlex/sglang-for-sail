@@ -128,7 +128,7 @@ def _resolve_encoder_batch_policy(
 ) -> Tuple[int, bool]:
     """Return effective batch size and same-turn coalescing policy."""
     max_batch_size = max(1, int(configured_max_batch_size))
-    coalesce_same_turn = model_type == "kimi_k3"
+    coalesce_same_turn = model_type in ("kimi_k3", "kimi_k31")
     if coalesce_same_turn and not max_batch_size_is_explicit:
         max_batch_size = min(max_batch_size, _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE)
     return max_batch_size, coalesce_same_turn
