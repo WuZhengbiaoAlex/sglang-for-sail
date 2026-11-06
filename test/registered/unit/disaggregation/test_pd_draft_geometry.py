@@ -2,6 +2,7 @@
 
 import struct
 import unittest
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,303 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestPDDraftGeometry(CustomTestCase):
+    def test_compressed_target_pages_and_draft_rows(self):
+        import ctypes
+
+        import torch
+
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4SingleKVPool,
+            KVLayout,
+        )
+
+        for ratio, expected_bytes in ((4, 37440), (128, 1728)):
+            for src_rank in (0, 1):
+                with self.subTest(ratio=ratio, src_rank=src_rank):
+                    pool = DeepSeekV4SingleKVPool.__new__(DeepSeekV4SingleKVPool)
+                    pool.page_size = 256 // ratio
+                    pool.kv_layout = KVLayout.V4
+                    pool.qk_nope_head_dim = 448
+                    pool.qk_rope_head_dim = 64
+                    pool.rope_storage_dtype = torch.bfloat16
+                    pool.quantize_block_size = KVLayout.V4.tile_size
+                    pool.scale_pad = 1
+                    pool.store_dtype = torch.uint8
+                    pool.device = "cpu"
+                    target = pool.create_buffer(num_pages=5)
+                    for page_index in range(5):
+                        target[page_index].fill_(17 + page_index)
+                    dest = torch.zeros_like(target)
+                    page_bytes = target.stride(0)
+                    self.assertEqual(page_bytes, expected_bytes)
+                    draft = (
+                        torch.arange(2560, dtype=torch.int32)
+                        .remainder(251)
+                        .to(torch.uint8)
+                        .view(1280, 1, 2)
+                    )
+                    draft_dest = torch.zeros((1280, 2, 2), dtype=torch.uint8)
+                    mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+                    mgr.attn_tp_size = 16
+                    mgr.is_mla_backend = True
+                    mgr.is_hybrid_mla_backend = False
+                    mgr._validate_envelope_kv_layout = lambda *args: None
+                    a = mgr.kv_args = KVArgs()
+                    a.page_size = 256
+                    a.engine_rank = src_rank
+                    a.kv_data_ptrs = [target.data_ptr(), draft.data_ptr()]
+                    a.kv_item_lens = [page_bytes, 512]
+                    a.kv_layer_ids = [0, 1]
+                    a.mla_compression_ratios = [ratio]
+                    a.draft_kv_entry_count = 1
+                    a.draft_kv_head_num = 1
+                    a.draft_total_kv_head_num = 16
+                    a.draft_kv_token_major = True
+                    info = SimpleNamespace(
+                        dst_kv_ptrs=[dest.data_ptr(), draft_dest.data_ptr()],
+                        dst_kv_item_lens=[page_bytes, 1024],
+                        dst_kv_item_len=page_bytes,
+                        dst_kv_layer_ids=[0, 1],
+                        dst_draft_entry_count=1,
+                        dst_draft_token_major=True,
+                        dst_draft_head_num=2,
+                        dst_draft_total_head_num=16,
+                        dst_page_size=256,
+                        dst_dcp_size=1,
+                        dst_dcp_rank=0,
+                        dst_attn_tp_size=8,
+                        dst_tp_rank=0,
+                    )
+                    mgr.prepare_dcp_entry_geometry(info)
+
+                    def transfer(session, blocks):
+                        for src, dst, size in blocks:
+                            ctypes.memmove(dst, src, size)
+                        return 0
+
+                    mgr._transfer_data = transfer
+                    mgr.send_kvcache_mixed(
+                        "s",
+                        np.array([1, 3]),
+                        np.array([2, 4]),
+                        info=info,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=257,
+                    )
+                    expected = torch.zeros_like(dest)
+                    if src_rank == 0:
+                        expected[2] = target[1]
+                        expected[4] = target[3]
+                    torch.testing.assert_close(dest, expected)
+                    expected_draft = torch.zeros_like(draft_dest)
+                    expected_draft[512:768, src_rank] = draft[256:512, 0]
+                    expected_draft[1024, src_rank] = draft[768, 0]
+                    torch.testing.assert_close(draft_dest, expected_draft)
+                    mgr.attn_tp_size = 8
+                    a.engine_rank = 0
+                    a.draft_kv_head_num = 2
+                    a.kv_item_lens[1] = 1024
+                    equal_tp_draft = torch.full_like(draft_dest, 31)
+                    a.kv_data_ptrs[1] = equal_tp_draft.data_ptr()
+                    mgr.prepare_dcp_entry_geometry(info)
+                    dest.zero_()
+                    draft_dest.zero_()
+                    mgr.send_kvcache_mixed(
+                        "s",
+                        np.array([1, 3]),
+                        np.array([2, 4]),
+                        info=info,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=257,
+                    )
+                    expected[2] = target[1]
+                    expected[4] = target[3]
+                    torch.testing.assert_close(dest, expected)
+                    expected_draft.zero_()
+                    expected_draft[512:768] = 31
+                    expected_draft[1024] = 31
+                    torch.testing.assert_close(draft_dest, expected_draft)
+                    info.dst_kv_item_lens[0] += 576
+                    with self.assertRaisesRegex(ValueError, "Target KV"):
+                        mgr.prepare_dcp_entry_geometry(info)
+                    info.dst_kv_item_lens[0] -= 576
+                    info.dst_dcp_size = 8
+                    with self.assertRaisesRegex(ValueError, "Decode DCP1"):
+                        mgr.prepare_dcp_entry_geometry(info)
+
+    def test_hisparse_target_and_draft_use_independent_page_indices(self):
+        import ctypes
+
+        import torch
+
+        from sglang.srt.disaggregation.mooncake import conn as mc
+
+        for src_tp, src_rank in ((8, 0), (16, 0), (16, 1)):
+            with self.subTest(src_tp=src_tp, src_rank=src_rank):
+                # Wire order: C4 KV (host), C4 indexer, C128 KV, draft (device).
+                # C4/C128 page strides include the production layout's padding.
+                target_widths = [37440, 64 * 132, 1728]
+                sources = [
+                    torch.arange(4 * width)
+                    .remainder(251)
+                    .to(torch.uint8)
+                    .view(4, width)
+                    for width in target_widths
+                ]
+                destinations = [
+                    torch.zeros((8, width), dtype=torch.uint8)
+                    for width in target_widths
+                ]
+                src_heads = 16 // src_tp
+                draft = (
+                    torch.arange(4 * 256 * src_heads * 2)
+                    .remainder(251)
+                    .to(torch.uint8)
+                    .view(4 * 256, src_heads, 2)
+                )
+                draft_dest = torch.zeros((8 * 256, 2, 2), dtype=torch.uint8)
+                sources.append(draft)
+                destinations.append(draft_dest)
+                mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+                mgr.attn_tp_size = src_tp
+                mgr.is_mla_backend = True
+                mgr.is_hybrid_mla_backend = False
+                mgr._validate_envelope_kv_layout = Mock()
+                args = mgr.kv_args = KVArgs()
+                args.page_size = 256
+                args.engine_rank = src_rank
+                args.kv_data_ptrs = [t.data_ptr() for t in sources]
+                args.kv_item_lens = target_widths + [256 * src_heads * 2]
+                args.kv_layer_ids = list(range(4))
+                args.mla_compression_ratios = [4, 128]
+                args.prefill_start_layer = 0
+                args.prefill_end_layer = 2
+                args.draft_kv_entry_count = 1
+                args.draft_kv_head_num = src_heads
+                args.draft_total_kv_head_num = 16
+                args.draft_kv_token_major = True
+                info = SimpleNamespace(
+                    dst_kv_ptrs=[t.data_ptr() for t in destinations],
+                    dst_kv_item_lens=target_widths + [1024],
+                    dst_kv_item_len=target_widths[0],
+                    dst_kv_layer_ids=list(range(4)),
+                    dst_draft_entry_count=1,
+                    dst_draft_token_major=True,
+                    dst_draft_head_num=2,
+                    dst_draft_total_head_num=16,
+                    dst_page_size=256,
+                    dst_dcp_size=1,
+                    dst_dcp_rank=0,
+                    dst_attn_tp_size=8,
+                    dst_tp_rank=0,
+                )
+                mgr.prepare_dcp_entry_geometry(info)
+
+                def transfer(session, blocks):
+                    for src, dst, size in blocks:
+                        ctypes.memmove(dst, src, size)
+                    return 0
+
+                mgr._transfer_data = Mock(side_effect=transfer)
+                kwargs = dict(
+                    info=info,
+                    src_page_offset=0,
+                    decode_prefix_len=0,
+                    num_kv_tokens=257,
+                )
+                with patch.object(
+                    mc,
+                    "build_dcp_token_transfer_plan",
+                    wraps=mc.build_dcp_token_transfer_plan,
+                ) as build_plan:
+                    mgr.send_kvcache_mixed(
+                        "s",
+                        np.array([1, 3]),
+                        np.array([2, 4]),
+                        dst_device_kv_indices=np.array([5, 7]),
+                        **kwargs,
+                    )
+                self.assertEqual(build_plan.call_count, 1)
+                for entry, (source, dest) in enumerate(
+                    zip(sources[:-1], destinations[:-1])
+                ):
+                    expected = torch.zeros_like(dest)
+                    if src_rank == 0:
+                        pages = (2, 4) if entry == 0 else (5, 7)
+                        expected[pages[0]] = source[1]
+                        expected[pages[1]] = source[3]
+                    torch.testing.assert_close(dest, expected)
+                expected_draft = torch.zeros_like(draft_dest)
+                heads = slice(src_rank * src_heads, (src_rank + 1) * src_heads)
+                expected_draft[5 * 256 : 6 * 256, heads] = draft[256:512]
+                expected_draft[7 * 256, heads] = draft[3 * 256]
+                torch.testing.assert_close(draft_dest, expected_draft)
+
+                # Bad page vectors must fail before issuing any transfer.
+                for src, host, device in (
+                    ([1, 3], [2, 4], []),
+                    ([1, 3], [2, 4], [5]),
+                    ([1, 3], [2, 4], [5, 7, 9]),
+                    ([1, 3], [2, 4], [-1, 7]),
+                    ([1, 3], [2, 4], [[5, 7]]),
+                    ([1, 3], [-1, 4], [5, 7]),
+                    ([1, 3], [2], [5, 7]),
+                    ([-1, 3], [2, 4], [5, 7]),
+                ):
+                    with self.subTest(src=src, host=host, device=device):
+                        mgr._transfer_data.reset_mock()
+                        with self.assertRaises(ValueError):
+                            mgr.send_kvcache_mixed(
+                                "s",
+                                np.array(src),
+                                np.array(host),
+                                dst_device_kv_indices=np.array(device),
+                                **kwargs,
+                            )
+                        mgr._transfer_data.assert_not_called()
+                info.dst_dcp_size = 8
+                with self.assertRaisesRegex(ValueError, "HiSparse.*DCP1"):
+                    mgr.send_kvcache_mixed(
+                        "s",
+                        np.array([1, 3]),
+                        np.array([2, 4]),
+                        dst_device_kv_indices=np.array([5, 7]),
+                        **kwargs,
+                    )
+                mgr._transfer_data.assert_not_called()
+
+    def test_token_major_draft_metadata_matches_registered_buffers(self):
+        import torch
+
+        from sglang.srt.disaggregation.utils import set_draft_kv_transfer_metadata
+
+        for mismatch in (None, "pointer", "length", "page_width"):
+            with self.subTest(mismatch=mismatch):
+                buffers = [torch.zeros((32, 2, 3)) for _ in range(2)]
+                ptrs = [t.data_ptr() for t in buffers]
+                lengths = [t.nbytes for t in buffers]
+                item_lens = [96, 96]
+                if mismatch == "pointer":
+                    ptrs[0] += 4
+                elif mismatch == "length":
+                    lengths[0] += 4
+                elif mismatch == "page_width":
+                    item_lens[0] += 4
+                pool = SimpleNamespace(
+                    head_num=2,
+                    page_size=4,
+                    k_buffer=buffers[:1],
+                    v_buffer=buffers[1:],
+                    get_contiguous_buf_infos=lambda: (ptrs, lengths, item_lens),
+                )
+                args = KVArgs()
+                set_draft_kv_transfer_metadata(
+                    args, pool, draft_kv_entry_count=2, tp_size=8, total_head_num=16
+                )
+                self.assertEqual(args.draft_kv_token_major, mismatch is None)
+
     def test_contiguous_full_head_rows_are_coalesced(self):
         from sglang.srt.disaggregation.common.utils import (
             build_draft_head_transfer_blocks,
@@ -272,8 +570,6 @@ class TestPDDraftGeometry(CustomTestCase):
             mgr.prepare_dcp_entry_geometry(SimpleNamespace(dst_draft_token_major=True))
 
     def test_failure_status_reaches_transfer_caller(self):
-        from unittest.mock import Mock
-
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.attn_tp_size = 16
         mgr.is_mla_backend = False
@@ -295,6 +591,7 @@ class TestPDDraftGeometry(CustomTestCase):
             dst_dcp_size=8,
             dst_dcp_rank=7,
             dst_kv_layer_ids=[],
+            target_page_transfer=False,
             dcp_token_item_lens=[6, 3],
             dcp_dst_token_item_lens=[6, 6],
         )
@@ -339,7 +636,7 @@ class TestPDDraftGeometry(CustomTestCase):
             b"0",
         ]
         info = KVArgsRegisterInfo.from_zmq(msg)
-        self.assertIsNone(info.dst_kv_item_lens)
+        self.assertEqual(info.dst_kv_item_lens, [])
         with self.assertRaises(struct.error):
             KVArgsRegisterInfo.from_zmq(msg + [b"bad"])
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)

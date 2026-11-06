@@ -50,7 +50,7 @@ def run_loop(manager, method, messages, observe=None):
     with patch.object(
         mc.threading,
         "Thread",
-        side_effect=lambda target: NS(start=lambda: start(target)),
+        side_effect=lambda target, **kwargs: NS(start=lambda: start(target)),
     ):
         method()
     return events
@@ -92,10 +92,17 @@ def manager(draft=2, tp=16):
     m.session_lock = threading.Lock()
     m.failure_lock = threading.Lock()
     m._status_lock = threading.Lock()
+    m.connection_lock = threading.Lock()
+    m._socket_lock = threading.Lock()
+    m.server_args = NS(enable_pd_role_switch=False)
+    m._stopped = False
+    m._worker_threads = []
+    m.enable_deferred_decode_kv_release = False
+    m.kv_args.kv_transfer_metrics = None
     m.failure_records = {}
     m.request_status = {}
     m.enable_staging = False
-    m.sync_status_to_decode_endpoint = Mock()
+    m.send_kv_status_message = Mock()
     m._start_heartbeat_checker_thread = Mock()
     m.required_prefill_response_num_table = {}
     m.prefill_response_tracker = defaultdict(set)
@@ -215,7 +222,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
     def test_layer_split_mixed_pool_mapping_and_addresses(self):
         import ctypes
 
-        from sglang.srt.disaggregation.utils import get_transfer_kv_layer_ids
+        from sglang.srt.disaggregation.utils import build_kv_layer_ids
         from sglang.srt.mem_cache.dsa_cache_layer_split import (
             LayerSplitDSATokenToKVPool,
         )
@@ -257,7 +264,12 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                         dp, _, ds = dd.get_contiguous_buf_infos()
                         dst_ptrs += dp
                         dst_sizes += ds
-                        dst_ids = get_transfer_kv_layer_ids(dt, dd, 4)
+                        dst_ids = build_kv_layer_ids(
+                            token_to_kv_pool=dt,
+                            draft_token_to_kv_pool=dd,
+                            num_draft_entries=2,
+                            num_hidden_layers=4,
+                        )
                         self.assertEqual(dst_ids, [0, 1, 2, 3, 4, 4])
                         for rank in range(16 // dst_tp):
                             st, sd = target(split), pool("nhd")
@@ -277,7 +289,12 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                             kp, _, ks = sd.get_contiguous_buf_infos()
                             a.kv_data_ptrs = sp + kp
                             a.kv_item_lens = ss + ks
-                            a.kv_layer_ids = get_transfer_kv_layer_ids(st, sd, 4)
+                            a.kv_layer_ids = build_kv_layer_ids(
+                                token_to_kv_pool=st,
+                                draft_token_to_kv_pool=sd,
+                                num_draft_entries=2,
+                                num_hidden_layers=4,
+                            )
                             self.assertEqual(
                                 a.kv_layer_ids,
                                 ([2, 3] if split else [0, 1, 2, 3]) + [4, 4],
@@ -353,8 +370,18 @@ class TestMooncakeMixedTransfer(CustomTestCase):
             st, dt = target(True, shard), target(False)
             sd = pool("nhd")
             sd.start_layer = 0
-            src_ids = get_transfer_kv_layer_ids(st, None, 4)
-            dst_ids = get_transfer_kv_layer_ids(dt, sd, 4)
+            src_ids = build_kv_layer_ids(
+                token_to_kv_pool=st,
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=4,
+            )
+            dst_ids = build_kv_layer_ids(
+                token_to_kv_pool=dt,
+                draft_token_to_kv_pool=sd,
+                num_draft_entries=2,
+                num_hidden_layers=4,
+            )
             self.assertEqual(
                 mc.resolve_dcp_dst_entry_indices(src_ids, dst_ids, 2, 6),
                 [2 * shard, 2 * shard + 1],
@@ -487,6 +514,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     r.prefill_dp_rank = 0
                     r.bootstrap_room = 99
                     r.conclude_state = None
+                    r._connection_pool_entries = {}
                     m.connection_pool = {}
                     r._get_bootstrap_info_from_server = lambda dp, cp, tp, pp: dict(
                         rank_ip="localhost",
@@ -632,6 +660,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     r.prefill_dp_rank = 0
                     r.bootstrap_room = 99
                     r.conclude_state = None
+                    r._connection_pool_entries = {}
                     m.connection_pool = {}
                     r._get_bootstrap_info_from_server = lambda dp, cp, tp, pp: dict(
                         rank_ip="localhost", rank_port=1000 + tp, tp=tp
@@ -705,7 +734,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 self.assertEqual(m.request_status[1], KVPoll.Failed)
                 self.assertEqual(m.request_status[2], KVPoll.WaitingForInput)
                 self.assertIn("Rejected Mooncake registration", m.failure_records[1])
-                self.assertEqual(m.sync_status_to_decode_endpoint.call_count, 1)
+                self.assertEqual(m.send_kv_status_message.call_count, 1)
 
     def test_rejection_during_transfer_remains_failed(self):
         for hybrid in (False, True):
@@ -718,8 +747,8 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     m.bootstrap_port = 8998
                     m._staging_outstanding = defaultdict(int)
                     m._validate_envelope_kv_layout = Mock()
-                    m.sync_status_to_decode_endpoint = (
-                        mc.MooncakeKVManager.sync_status_to_decode_endpoint.__get__(m)
+                    m.send_kv_status_message = (
+                        mc.MooncakeKVManager.send_kv_status_message.__get__(m)
                     )
                     m._status_messages = Mock()
                     m._connect = Mock(
@@ -803,6 +832,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
 
     def test_success_notification_is_ordered_before_concurrent_failure(self):
         m = manager()
+        del m.send_kv_status_message
         m.request_status[1] = KVPoll.Success
         sending, release = threading.Event(), threading.Event()
         failing, failed = threading.Event(), threading.Event()
@@ -822,8 +852,10 @@ class TestMooncakeMixedTransfer(CustomTestCase):
 
         def notify_success():
             try:
-                mc.MooncakeKVManager.sync_status_to_decode_endpoint(
-                    m, "localhost", 1234, 1, KVPoll.Success, 0
+                m.conclude_transfer(
+                    bootstrap_room=1,
+                    status=KVPoll.Success,
+                    targets=[("localhost", 1234)],
                 )
             except BaseException as exc:
                 errors.append(exc)
@@ -833,8 +865,10 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 failing.set()
                 m.update_status(1, KVPoll.Failed)
                 transitioned.set()
-                mc.MooncakeKVManager.sync_status_to_decode_endpoint(
-                    m, "localhost", 1234, 1, KVPoll.Failed, 0
+                m.conclude_transfer(
+                    bootstrap_room=1,
+                    status=KVPoll.Failed,
+                    targets=[("localhost", 1234)],
                 )
             except BaseException as exc:
                 errors.append(exc)
@@ -875,10 +909,14 @@ class TestMooncakeMixedTransfer(CustomTestCase):
         m._status_messages = Mock()
         m._connect = Mock(return_value=NS(send_multipart=m._status_messages))
         m._socket_send_locks = defaultdict(threading.Lock)
-        mc.MooncakeKVManager.sync_status_to_decode_endpoint(
-            m, "localhost", 1234, 1, KVPoll.Success, 0
+        m.conclude_transfer(
+            bootstrap_room=1,
+            status=KVPoll.Success,
+            targets=[("localhost", 1234)],
         )
-        m._status_messages.assert_not_called()
+        self.assertEqual(
+            m.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
+        )
         sender = mc.MooncakeKVSender.__new__(mc.MooncakeKVSender)
         sender.kv_mgr = m
         sender.bootstrap_room = 1
@@ -914,7 +952,11 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     mc,
                     "group_concurrent_contiguous",
                     wraps=mc.group_concurrent_contiguous,
-                ) as grouping:
+                ) as grouping, patch.object(
+                    mc,
+                    "build_dcp_token_transfer_plan",
+                    wraps=mc.build_dcp_token_transfer_plan,
+                ) as planning:
                     m.send_kvcache_mixed(
                         "ok",
                         np.array([1, 3]),
@@ -925,6 +967,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                         num_kv_tokens=65,
                     )
                 self.assertEqual(grouping.call_count, 1 if rank == 0 else 0)
+                self.assertEqual(planning.call_count, 1)
                 blocks = m._transfer_data.call_args.args[1]
                 expected = []
                 if rank == 0:
@@ -960,6 +1003,97 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 ) as prefetch:
                     m._prefetch_staging_reqs(1)
                 self.assertEqual(prefetch.call_count, int(present))
+
+    def test_transfer_worker_preserves_hisparse_device_page_slice(self):
+        m = manager()
+        m.enable_trace = False
+        m.bootstrap_port = 8998
+        m._staging_outstanding = defaultdict(int)
+        m._validate_envelope_kv_layout = Mock()
+        m._transfer_data = Mock(return_value=0)
+        m.send_aux = Mock(return_value=0)
+        m.kv_args.mla_compression_ratios = [4]
+        m.kv_args.prefill_start_layer = 0
+        m.kv_args.prefill_end_layer = 1
+        m._register_decode_peer(registration("s"), "s")
+        self.assertNotIn("s", m.rejected_registrations)
+
+        host_pages = np.array([7, 9, 11, 13], dtype=np.int32)
+        device_pages = np.array([17, 19, 23, 29], dtype=np.int32)
+        wire = request("s", 1)
+        wire[4] = host_pages.tobytes()
+        wire.extend([b"0", device_pages.tobytes()])
+        m.request_status[1] = KVPoll.WaitingForInput
+        m.transfer_infos[1] = {"s": mc.TransferInfo.from_zmq(wire)}
+        src_pages = np.array([1, 3], dtype=np.int32)
+        chunk = NS(
+            room=1,
+            staging_counted=False,
+            is_last_chunk=True,
+            index_slice=slice(1, 3),
+            prefill_kv_indices=src_pages,
+            num_kv_tokens=65,
+            state_indices=[],
+            prefill_aux_index=0,
+        )
+        with patch.object(
+            m, "send_kvcache_mixed", wraps=m.send_kvcache_mixed
+        ) as mixed:
+            m.transfer_worker(NS(get=Mock(side_effect=[chunk, None])), None)
+
+        mixed.assert_called_once()
+        np.testing.assert_array_equal(mixed.call_args.args[1], src_pages)
+        np.testing.assert_array_equal(mixed.call_args.args[2], host_pages[1:3])
+        np.testing.assert_array_equal(
+            mixed.call_args.kwargs["dst_device_kv_indices"], device_pages[1:3]
+        )
+        self.assertEqual(mixed.call_args.kwargs["num_kv_tokens"], 65)
+        self.assertEqual(m.request_status[1], KVPoll.Success)
+        self.assertNotIn(1, m.transfer_infos)
+        self.assertFalse(m._staging_outstanding)
+        self.assertEqual(
+            m.send_kv_status_message.call_args.kwargs["status"], KVPoll.Success
+        )
+        # The draft is device-resident, even though the main destination pages
+        # belong to the independent HiSparse host allocator.
+        blocks = m._transfer_data.call_args.args[1]
+        self.assertIn((20000 + 64 * 16, 50000 + 19 * 64 * 32, 16), blocks)
+        self.assertIn((10000 + 64, 40000 + 9 * 64, 64), blocks)
+
+    def test_registration_only_allocates_pack_buffers_for_packed_dcp_path(self):
+        for hybrid in (False, True):
+            for has_draft in (False, True):
+                with self.subTest(hybrid=hybrid, has_draft=has_draft):
+                    m = manager(draft=2 if has_draft else 0)
+                    m.is_mla_backend = not hybrid
+                    m.is_hybrid_mla_backend = hybrid
+                    m._init_dcp_pack_buffers_once = Mock()
+                    wire = registration("s", count=2 if has_draft else 0)
+                    wire[16] = b"8"
+                    if has_draft:
+                        wire[18] = struct.pack("3Q", 64, 16384, 16384)
+                    else:
+                        m.kv_args.kv_data_ptrs = m.kv_args.kv_data_ptrs[:1]
+                        m.kv_args.kv_item_lens = m.kv_args.kv_item_lens[:1]
+                        m.kv_args.kv_layer_ids = [0]
+                        wire[4] = struct.pack("Q", 40000)
+                        wire[12] = struct.pack("I", 0)
+                        wire[18] = struct.pack("Q", 64)
+                    m._register_decode_peer(wire, "s")
+                    self.assertNotIn("s", m.rejected_registrations)
+                    info = m.decode_kv_args_table["s"]
+                    self.assertTrue(info.requires_dcp_relayout)
+                    self.assertEqual(info.dcp_token_item_lens[0], 1)
+                    if has_draft:
+                        self.assertEqual(info.dcp_token_item_lens[1:], [16, 16])
+                        self.assertEqual(
+                            info.dcp_dst_token_item_lens[1:], [32, 32]
+                        )
+                        m._init_dcp_pack_buffers_once.assert_not_called()
+                    else:
+                        m._init_dcp_pack_buffers_once.assert_called_once_with(
+                            8, include_draft=True
+                        )
 
     def test_registration_changes_do_not_terminate_transfer_worker(self):
         for change in ("reject", "recover", "missing"):
@@ -1069,8 +1203,8 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 self.assertNotIn(2, m.transfer_infos)
                 self.assertFalse(m._staging_outstanding)
                 statuses = [
-                    (c.args[2], c.args[3])
-                    for c in m.sync_status_to_decode_endpoint.call_args_list
+                    (c.kwargs["bootstrap_room"], c.kwargs["status"])
+                    for c in m.send_kv_status_message.call_args_list
                 ]
                 self.assertIn((1, KVPoll.Failed), statuses)
                 self.assertIn((2, KVPoll.Success), statuses)

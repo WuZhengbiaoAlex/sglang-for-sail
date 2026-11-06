@@ -625,7 +625,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        draft_kv_entry_count = 0
         if self.draft_token_to_kv_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
@@ -635,19 +634,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
-            draft_kv_entry_count = len(draft_kv_data_ptrs)
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
 
-        draft_pool = self.draft_token_to_kv_pool
         set_draft_kv_transfer_metadata(
             kv_args,
-            draft_pool,
-            draft_kv_entry_count=draft_kv_entry_count,
+            self.draft_token_to_kv_pool,
+            draft_kv_entry_count=num_draft_entries,
             tp_size=get_parallel().attn_tp_size,
             total_head_num=(
                 get_draft_total_num_kv_heads(self.scheduler)
-                if draft_kv_entry_count
+                if num_draft_entries
                 else None
             ),
         )

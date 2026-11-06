@@ -217,6 +217,9 @@ def build_dcp_token_transfer_plan(
 
     draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
     draft_local = src_page_offset * physical_page_size + draft_offsets
+    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
+    if replicate_to_virtual:
+        return DCPTokenTransferPlan(draft_src, draft_dst)
     chunk_start = decode_prefix_len + src_page_offset * physical_page_size
     target_offsets = np.arange(
         (dcp_rank - chunk_start) % dcp_size,
@@ -226,9 +229,6 @@ def build_dcp_token_transfer_plan(
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
-    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
-    if replicate_to_virtual:
-        return DCPTokenTransferPlan(draft_src, draft_dst)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
 
 

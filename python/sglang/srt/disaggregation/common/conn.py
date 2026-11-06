@@ -2197,8 +2197,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
-        if self.draft_kv_entry_count is None and "draft_kv_entry_count" in data:
-            self.draft_kv_entry_count = int(data["draft_kv_entry_count"])
+        if "draft_kv_entry_count" in data:
+            # A layer-sharded rank may own no draft buffers. Retain senders
+            # whenever any rank advertises head-sharded draft KV.
+            self.draft_kv_entry_count = max(
+                self.draft_kv_entry_count or 0,
+                int(data["draft_kv_entry_count"]),
+            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
