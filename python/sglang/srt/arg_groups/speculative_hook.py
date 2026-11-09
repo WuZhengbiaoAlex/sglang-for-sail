@@ -861,6 +861,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
+        if draft_backend == "flashmla" and not current_platform.is_out_of_tree():
+            # The PPU DFlash adapter is explicit opt-in. Preserve the previous
+            # fallback when only the target selected FlashMLA; plugin platforms
+            # retain their existing backend capability decisions.
+            draft_backend = get_fallback_backend()
     if draft_backend is None:
         draft_backend = get_fallback_backend()
     elif not is_supported_backend(draft_backend):

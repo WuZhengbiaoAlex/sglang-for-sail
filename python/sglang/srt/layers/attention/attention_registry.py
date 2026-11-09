@@ -220,6 +220,17 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if runner.is_draft_worker and get_spec().speculative_algorithm == "DFLASH":
+        if not _is_ppu or not runner.use_mla_backend:
+            raise ValueError(
+                "DFlash FlashMLA currently supports absorbed MLA drafts on PPU only."
+            )
+        from sglang.srt.layers.attention.dflash_flashmla_backend import (
+            DFlashFlashMLABackend,
+        )
+
+        return DFlashFlashMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)

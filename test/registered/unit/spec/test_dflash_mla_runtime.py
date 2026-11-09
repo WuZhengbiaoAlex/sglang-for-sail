@@ -1,12 +1,11 @@
 """DFlash2 MLA configuration and accepted-prefix cache contracts on CPU."""
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from transformers import Qwen3Config
-
 from sglang.srt.arg_groups import speculative_hook
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.layers.radix_attention import AttentionType
@@ -20,6 +19,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from transformers import Qwen3Config
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -175,6 +175,128 @@ class TestDFlashMLARuntime(CustomTestCase):
         ):
             speculative_hook._resolve_dflash_draft_attention_backend(object())
         self.assertEqual(resolved, {"speculative_draft_attention_backend": "triton"})
+
+    def test_inherited_flashmla_keeps_previous_platform_default(self):
+        for is_ppu, expected in ((True, "triton"), (False, "flashinfer")):
+            with self.subTest(is_ppu=is_ppu):
+                cfg = SimpleNamespace(speculative_draft_attention_backend=None)
+                resolved = {}
+                with (
+                    mock.patch.object(
+                        speculative_hook, "resolving_view", return_value=cfg
+                    ),
+                    mock.patch.object(
+                        speculative_hook, "resolved_view", return_value=cfg
+                    ),
+                    mock.patch.object(
+                        speculative_hook,
+                        "attention_backends_of",
+                        return_value=("flashmla", "flashmla"),
+                    ),
+                    mock.patch.object(
+                        speculative_hook.current_platform,
+                        "is_out_of_tree",
+                        return_value=False,
+                    ),
+                    mock.patch("sglang.srt.utils.is_ppu", return_value=is_ppu),
+                    mock.patch.object(
+                        speculative_hook,
+                        "get_platform",
+                        return_value=SimpleNamespace(is_xpu=False, is_hip=False),
+                    ),
+                    mock.patch.object(
+                        speculative_hook,
+                        "declare_resolution",
+                        side_effect=lambda args, source, **kw: resolved.update(kw),
+                    ),
+                ):
+                    speculative_hook._resolve_dflash_draft_attention_backend(object())
+                self.assertEqual(
+                    resolved, {"speculative_draft_attention_backend": expected}
+                )
+
+    def test_out_of_tree_inherited_flashmla_keeps_platform_capability(self):
+        cfg = SimpleNamespace(speculative_draft_attention_backend=None)
+        resolved = {}
+        platform = SimpleNamespace(
+            is_out_of_tree=lambda: True,
+            supports_speculative_draft_attention_backend=lambda algorithm, backend: (
+                algorithm == "DFLASH" and backend == "flashmla"
+            ),
+        )
+        with (
+            mock.patch.object(speculative_hook, "resolving_view", return_value=cfg),
+            mock.patch.object(speculative_hook, "resolved_view", return_value=cfg),
+            mock.patch.object(
+                speculative_hook,
+                "attention_backends_of",
+                return_value=("flashmla", "flashmla"),
+            ),
+            mock.patch.object(speculative_hook, "current_platform", platform),
+            mock.patch.object(
+                speculative_hook,
+                "declare_resolution",
+                side_effect=lambda args, source, **kw: resolved.update(kw),
+            ),
+        ):
+            speculative_hook._resolve_dflash_draft_attention_backend(object())
+        self.assertEqual(resolved, {"speculative_draft_attention_backend": "flashmla"})
+
+    def test_explicit_flashmla_draft_is_not_replaced_with_triton(self):
+        cfg = SimpleNamespace(speculative_draft_attention_backend="flashmla")
+        resolved = {}
+        with (
+            mock.patch.object(speculative_hook, "resolving_view", return_value=cfg),
+            mock.patch.object(
+                speculative_hook.current_platform, "is_out_of_tree", return_value=False
+            ),
+            mock.patch.object(
+                speculative_hook,
+                "declare_resolution",
+                side_effect=lambda args, source, **kw: resolved.update(kw),
+            ),
+        ):
+            speculative_hook._resolve_dflash_draft_attention_backend(object())
+        self.assertEqual(resolved, {"speculative_draft_attention_backend": "flashmla"})
+
+    def test_flashmla_dflash_routing_preserves_other_workers(self):
+        from sglang.srt.layers.attention import attention_registry as registry
+
+        sparse = mock.Mock()
+        ordinary = mock.Mock()
+        modules = {
+            "sglang.srt.layers.attention.dflash_flashmla_backend": SimpleNamespace(
+                DFlashFlashMLABackend=sparse
+            ),
+            "sglang.srt.layers.attention.flashmla_backend": SimpleNamespace(
+                FlashMLABackend=ordinary
+            ),
+        }
+        runner = SimpleNamespace(is_draft_worker=True, use_mla_backend=True)
+        spec = SimpleNamespace(speculative_algorithm="DFLASH")
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(registry, "_is_ppu", True),
+            mock.patch.object(registry, "get_spec", return_value=spec),
+        ):
+            self.assertIs(registry.create_flashmla_backend(runner), sparse.return_value)
+            runner.is_draft_worker = False
+            self.assertIs(
+                registry.create_flashmla_backend(runner), ordinary.return_value
+            )
+            runner.is_draft_worker = True
+            spec.speculative_algorithm = "EAGLE"
+            self.assertIs(
+                registry.create_flashmla_backend(runner), ordinary.return_value
+            )
+            spec.speculative_algorithm = "DFLASH"
+            runner.use_mla_backend = False
+            with self.assertRaisesRegex(ValueError, "absorbed MLA drafts on PPU"):
+                registry.create_flashmla_backend(runner)
+            runner.use_mla_backend = True
+            with mock.patch.object(registry, "_is_ppu", False):
+                with self.assertRaisesRegex(ValueError, "absorbed MLA drafts on PPU"):
+                    registry.create_flashmla_backend(runner)
 
 
 if __name__ == "__main__":
