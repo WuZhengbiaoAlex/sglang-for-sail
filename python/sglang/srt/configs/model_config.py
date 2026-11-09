@@ -1169,6 +1169,18 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
+        self.is_dflash_mla_draft = False
+        if getattr(self.hf_config, "dflash_config", None):
+            from sglang.srt.speculative.dflash_utils import (
+                is_dflash_mla_draft_config,
+                validate_dflash_mla_draft_config,
+            )
+
+            self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
+            if self.is_dflash_mla_draft:
+                # Validate the export before generic defaults hide missing dimensions.
+                validate_dflash_mla_draft_config(self.hf_config)
+
         # Pure SSM models have no attention heads; use head_dim == 0 so the
         # KV-cell size is 0 rather than a division on a missing head count.
         is_pure_ssm = any(
@@ -1203,7 +1215,8 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            self.is_dflash_mla_draft
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
@@ -1243,6 +1256,9 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            if self.is_dflash_mla_draft:
+                # Sliding layers share latent rows; ignore the GQA template width.
+                self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)

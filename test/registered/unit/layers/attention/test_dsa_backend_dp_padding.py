@@ -1,6 +1,6 @@
 import unittest
 from types import MethodType, ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,12 +11,15 @@ from sglang.srt.layers.attention.dsa_backend import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestDSABackendDPPadding(unittest.TestCase):
+class TestDSABackendDPPadding(CustomTestCase):
     def test_occupied_uneven_decode_with_idle_rank_selects_max_len(self):
         with (
             patch(
@@ -181,6 +184,153 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertEqual(output.shape, (4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
+
+
+class TestDSAEmptyDPMetadata(CustomTestCase):
+    def make_backend(self):
+        # Keep metadata construction real; replace only accelerator planners
+        # and hardware queries. No model or KV pool allocation is needed.
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.device = "cpu"
+        backend.real_page_size = 64
+        backend.speculative_num_draft_tokens = 5
+        backend.dsa_index_topk = 4
+        backend.dsa_index_kpool = 1
+        backend.dsa_prefill_impl = "flashmla_sparse_q8"
+        backend.dsa_decode_impl = "flashmla_sparse_q8"
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.enable_auto_select_prefill_impl = False
+        backend.supports_mha_one_shot = False
+        backend.use_mha = True
+        backend._is_in_breakable_cuda_graph = lambda: False
+        backend._is_in_tc_piecewise_cuda_graph = lambda: False
+        backend._get_device_sm = lambda: 80
+        backend._is_blackwell = lambda: False
+        backend.token_to_kv_pool = SimpleNamespace(
+            dtype=torch.bfloat16, size=128, page_size=64
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(3 * 16, dtype=torch.int32).view(3, 16)
+        )
+        backend._arange_buf = torch.arange(32, dtype=torch.int32)
+        backend.forward_metadata = object()  # A preceding nonempty iteration.
+        backend._build_topk_v2_plan = Mock(return_value=torch.tensor([[7, 8]]))
+        backend._build_paged_mqa_schedule_metadata = Mock(
+            return_value=torch.tensor([[9, 10]])
+        )
+        backend._compute_flashmla_metadata = Mock()
+        return backend
+
+    def make_batch(self, mode, seq_lens, extend_lens=None, *, host_lens=True):
+        lengths = torch.tensor(seq_lens, dtype=torch.int64)
+        extend_lens = extend_lens if extend_lens is not None else []
+        return SimpleNamespace(
+            batch_size=len(seq_lens),
+            forward_mode=mode,
+            seq_lens=lengths,
+            seq_lens_cpu=lengths.clone() if host_lens else None,
+            seq_lens_sum=sum(seq_lens),
+            req_pool_indices=torch.arange(len(seq_lens), dtype=torch.int64),
+            extend_seq_lens_cpu=extend_lens,
+            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+            extend_prefix_lens_cpu=[
+                kv - q for kv, q in zip(seq_lens, extend_lens, strict=False)
+            ],
+            extend_num_tokens=sum(extend_lens),
+            global_num_tokens_cpu=None,
+        )
+
+    def test_empty_idle_extend_and_verify_skip_all_native_planning(self):
+        for mode in (
+            ForwardMode.IDLE,
+            ForwardMode.EXTEND,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            for host_lens in (True, False):
+                with self.subTest(mode=mode, host_lens=host_lens):
+                    backend = self.make_backend()
+                    batch = self.make_batch(mode, [], host_lens=host_lens)
+                    # Other DP groups are busy; physical token padding does
+                    # not create logical attention requests on this rank.
+                    batch.global_num_tokens_cpu = [5, 0, 0, 0]
+                    backend.init_forward_metadata(batch)
+                    self.assertIsNone(backend.forward_metadata)
+                    self.assertFalse(backend.use_mha)
+                    self.assertEqual(backend.dsa_prefill_impl, "flashmla_sparse_q8")
+                    backend._build_topk_v2_plan.assert_not_called()
+                    backend._build_paged_mqa_schedule_metadata.assert_not_called()
+                    backend._compute_flashmla_metadata.assert_not_called()
+
+    def test_nonempty_decode_rebuilds_after_idle_with_or_without_host_lengths(self):
+        for host_lens in (True, False):
+            with self.subTest(host_lens=host_lens):
+                backend = self.make_backend()
+                batch = self.make_batch(ForwardMode.DECODE, [6, 9], host_lens=host_lens)
+                with (
+                    get_parallel().override(attn_cp_size=1),
+                    patch(
+                        "sglang.srt.layers.attention.dsa_backend.is_cuda",
+                        return_value=True,
+                    ),
+                ):
+                    backend.init_forward_metadata(batch)
+                    previous = backend.forward_metadata
+                    backend.init_forward_metadata(self.make_batch(ForwardMode.IDLE, []))
+                    backend.init_forward_metadata(batch)
+                metadata = backend.forward_metadata
+                self.assertIsNot(metadata, previous)
+                self.assertEqual(metadata.max_seq_len_k, 9)
+                self.assertEqual(metadata.max_seq_len_q, 1)
+                self.assertEqual(metadata.cache_seqlens_int32.tolist(), [6, 9])
+                self.assertEqual(metadata.cu_seqlens_k.tolist(), [0, 6, 15])
+                self.assertEqual(metadata.cu_seqlens_q.tolist(), [0, 1, 2])
+                self.assertEqual(metadata.dsa_cache_seqlens_int32.tolist(), [4, 4])
+                self.assertEqual(metadata.page_table_1.shape, (2, 9))
+                self.assertEqual(metadata.paged_mqa_ctx_lens_2d.tolist(), [[6], [9]])
+                self.assertIs(
+                    metadata.topk_v2_plan, backend._build_topk_v2_plan.return_value
+                )
+                self.assertEqual(backend._build_topk_v2_plan.call_count, 2)
+                self.assertEqual(
+                    backend._build_paged_mqa_schedule_metadata.call_count, 2
+                )
+                self.assertEqual(
+                    backend._build_topk_v2_plan.call_args.args[0].tolist(), [6, 9]
+                )
+
+    def test_nonempty_q8_extend_preserves_ragged_prefix_metadata(self):
+        backend = self.make_backend()
+        batch = self.make_batch(ForwardMode.EXTEND, [6, 9], [2, 3])
+        with (
+            get_parallel().override(attn_cp_size=1),
+            patch("sglang.srt.layers.attention.dsa_backend.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.can_dsa_prefill_cp_interleave",
+                return_value=False,
+            ),
+        ):
+            backend.init_forward_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertFalse(backend.use_mha)
+        self.assertEqual(backend.dsa_prefill_impl, "flashmla_sparse_q8")
+        self.assertEqual(metadata.max_seq_len_q, 3)
+        self.assertEqual(metadata.max_seq_len_k, 9)
+        self.assertEqual(metadata.cu_seqlens_q.tolist(), [0, 2, 5])
+        self.assertEqual(metadata.dsa_seqlens_expanded.tolist(), [5, 6, 7, 8, 9])
+        self.assertEqual(metadata.topk_indices_offset.tolist(), [0, 0, 6, 6, 6])
+        self.assertEqual(
+            metadata.page_table_1_flattened.tolist(),
+            list(range(6)) + list(range(16, 25)),
+        )
+        self.assertEqual(metadata.indexer_k_start_end[0].tolist(), [0, 0, 6, 6, 6])
+        self.assertEqual(metadata.indexer_k_start_end[1].tolist(), [5, 6, 13, 14, 15])
+        self.assertEqual(metadata.token_to_batch_idx.tolist(), [0, 0, 1, 1, 1])
+        self.assertIs(metadata.topk_v2_plan, backend._build_topk_v2_plan.return_value)
+        self.assertEqual(
+            backend._build_topk_v2_plan.call_args.args[0].tolist(), [5, 6, 7, 8, 9]
+        )
+        backend._build_paged_mqa_schedule_metadata.assert_not_called()
 
 
 if __name__ == "__main__":

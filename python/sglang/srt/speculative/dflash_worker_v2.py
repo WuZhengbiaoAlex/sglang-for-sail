@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -425,6 +426,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DFLASH",
+                # The target already synchronized this seed before narrowing TP.
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -656,10 +659,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
+            if (
+                _is_npu
+                and get_parallel().enable_dp_attention
+                and capture_decode_cuda_graph
+            ):
                 # Idle DP ranks skip the draft step, so they cannot join a
                 # shared graph capture/replay; keep the draft eager under dp
-                # attention.
+                # attention on NPU. CUDA/PPU drafts run inside draft_tp_context
+                # and key their graphs by the local batch size, so an active
+                # DP group can replay without its idle peers.
                 capture_decode_cuda_graph = False
                 if self.model_runner.tp_rank == 0:
                     logger.warning(
@@ -1903,6 +1912,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if isinstance(attn, DFlashMLAAttention):
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
@@ -1953,6 +1972,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
@@ -2252,6 +2279,25 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    @staticmethod
+    def _apply_target_verify_graph_guards(
+        verify_forward_batch: ForwardBatch, *, is_extend_in_batch: bool
+    ) -> None:
+        if not get_parallel().enable_dp_attention:
+            return
+        # NPU idle ranks use eager verify, so active ranks must match their raw
+        # DP layout. CUDA/PPU idle ranks instead replay the same padded bucket.
+        if (
+            _is_npu
+            and verify_forward_batch.original_global_num_tokens_cpu is not None
+            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+        ):
+            verify_forward_batch.can_run_decode_cuda_graph = False
+        # Mixed prefill/verify rounds still need the raw, common DP layout on
+        # every platform; the CUDA idle-graph exception does not apply here.
+        if is_extend_in_batch:
+            verify_forward_batch.can_run_decode_cuda_graph = False
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2349,6 +2395,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
             # collectives are within-rank and skipped.
+            idle_can_run_cuda_graph = False
             if get_parallel().enable_dp_attention:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -2357,14 +2404,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     custom_mask=None,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
-                idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                idle_verify_forward_batch, idle_can_run_cuda_graph = (
+                    idle_verify_input.prepare_for_verify(batch, self._target_worker)
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                if _is_npu:
+                    # NPU active ranks also use eager verify when peers idle.
+                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                    idle_can_run_cuda_graph = False
+                # CUDA/PPU retain prepare_for_verify's graph decision. Every
+                # target DP rank selects max(original_global_num_tokens_cpu),
+                # including this zero-real-row rank, for one common padded
+                # graph bucket and [bucket * block_size] DP-gather layout.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2384,7 +2434,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=idle_can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
@@ -2556,6 +2606,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -2667,7 +2718,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ):
                 draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
                     propose_lilicorr_block(
                         head=self.lilicorr,
@@ -2744,22 +2798,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
-        if (
-            get_parallel().enable_dp_attention
-            and verify_forward_batch.original_global_num_tokens_cpu is not None
-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-        ):
-            verify_forward_batch.can_run_decode_cuda_graph = False
-
-        # Mixed-round guard: an extend rank's raw token counts disagree with
-        # the verify batch's spec-scaled counts on the DP-gather layout; run
-        # eager, symmetric with the idle guard above.
-        if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
-            verify_forward_batch.can_run_decode_cuda_graph = False
+        self._apply_target_verify_graph_guards(
+            verify_forward_batch, is_extend_in_batch=batch.is_extend_in_batch
+        )
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

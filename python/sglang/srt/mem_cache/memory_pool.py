@@ -4661,6 +4661,32 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope,
         )
 
+    def set_mla_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Commit each accepted prefix without a host read of commit_lens.
+
+        Rejected rows write the reserved padding slot 0. Retaining dense shapes
+        keeps speculative overlap and graph capture free of dynamic compaction.
+        Locations use the same convention as set_mla_kv_buffer.
+        """
+        if loc_2d.ndim != 2:
+            raise ValueError("MLA prefix-valid locations must be rank-2.")
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError("MLA commit_lens must match the location batch size.")
+        if cache_k_nope.shape[0] != loc_2d.numel() or (
+            cache_k_rope is not None and cache_k_rope.shape[0] != loc_2d.numel()
+        ):
+            raise ValueError("MLA KV rows must match the number of locations.")
+        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        loc = torch.where(offsets < commit_lens[:, None], loc_2d, 0).reshape(-1)
+        self.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,

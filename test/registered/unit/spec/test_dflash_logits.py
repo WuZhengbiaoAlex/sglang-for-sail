@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
     _grouped_conv,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -138,14 +138,13 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         _transform_unary_logits=lambda logits: logits.float(),
     )
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(tp_size=1),
-    )
-    monkeypatch.setattr(
         "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
-    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
+    with get_parallel().override(tp_group=SimpleNamespace(world_size=1)):
+        candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(
+            model, hidden
+        )
 
     expected_logits, expected_ids = torch.topk(
         torch.matmul(hidden, dense_weight.T), 4, dim=-1
@@ -193,17 +192,14 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         return torch.cat([rank0_ids.long(), x], dim=dim)
 
     monkeypatch.setattr(
-        "sglang.srt.models.dflash.get_parallel",
-        lambda: SimpleNamespace(tp_size=2),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
-    )
-    monkeypatch.setattr(
         "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
-    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
+    group = SimpleNamespace(world_size=2, all_gather=fake_all_gather)
+    with get_parallel().override(tp_group=group):
+        candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(
+            model, hidden
+        )
 
     expected_logits, expected_ids = torch.topk(
         torch.matmul(hidden, full_weight.T), k, dim=-1

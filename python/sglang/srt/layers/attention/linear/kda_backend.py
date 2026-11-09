@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_ppu, logger
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
@@ -564,6 +565,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.batch_size == 0:
+            # Empty eager EXTEND has no last extend_start_loc/extend_seq_lens.
+            # Publish fresh empty metadata instead of retaining a previous
+            # request's state slots. Padded graph buckets use separate APIs.
+            assert forward_batch.req_pool_indices.numel() == 0
+            self.forward_metadata = ForwardMetadata(
+                query_start_loc=torch.zeros(
+                    1, dtype=torch.int32, device=forward_batch.req_pool_indices.device
+                ),
+                mamba_cache_indices=forward_batch.req_pool_indices.to(torch.int32),
+                logical_num_tokens=0,
+            )
+            return
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
@@ -585,6 +599,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -839,6 +855,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        # Zero-row eager batches must not enter convolution, checkpointing or
+        # native recurrence kernels (dense verify's [0, T, -1] is ambiguous).
+        if mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
@@ -863,6 +883,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         logical_num_tokens = self.forward_metadata.logical_num_tokens
         if logical_num_tokens is None:
             logical_num_tokens = int(query_start_loc[-1])
+        if logical_num_tokens == 0:
+            return mixed_qkv.new_zeros(
+                (1, physical_num_tokens, layer.num_v_heads, layer.head_v_dim)
+            )
         if logical_num_tokens < physical_num_tokens:
             mixed_qkv = mixed_qkv[:logical_num_tokens]
             a = a[:, :logical_num_tokens]

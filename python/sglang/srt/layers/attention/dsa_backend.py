@@ -957,6 +957,18 @@ class DeepseekSparseAttnBackend(
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
+        if batch_size == 0:
+            # An idle DP rank still runs the model for cross-DP MLP collectives,
+            # but skips attention. Eager execution can present this as IDLE or
+            # an empty EXTEND/VERIFY. Do not reduce empty lengths, concatenate
+            # an empty request list, or launch native planners with zero rows.
+            # Clear the previous batch's metadata and dispatch state; capture
+            # and replay initialize their padded buckets through separate APIs.
+            assert forward_batch.seq_lens.numel() == 0
+            assert forward_batch.req_pool_indices.numel() == 0
+            self.forward_metadata = None
+            self.set_dsa_prefill_impl()
+            return
         device = forward_batch.seq_lens.device
 
         if forward_batch.forward_mode.is_target_verify():

@@ -270,12 +270,20 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
+    # The draft is constructed and executed within each attention-TP group.
+    if cfg.enable_dp_attention and not (
+        cfg.device == "npu" or cfg.device.startswith("cuda")
+    ):
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
+            "DFLASH speculative decoding supports dp attention on NPU and CUDA only."
         )
+    if (
+        cfg.enable_dp_attention
+        and cfg.device.startswith("cuda")
+        and not cfg.enable_dp_lm_head
+    ):
+        # Candidate selection consumes this DP group's tokens and target head.
+        declare_resolution(server_args, "_handle_dflash", enable_dp_lm_head=True)
 
     if cfg.pp_size != 1:
         raise ValueError(
@@ -841,10 +849,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                     "get_default_speculative_draft_attention_backend()."
                 )
             return fallback_backend
-        # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+        # PPU's draft uses Triton MLA; the target may independently use DSA.
+        from sglang.srt.utils import is_ppu
+
         return (
             "triton"
-            if (get_platform().is_xpu or get_platform().is_hip)
+            if (is_ppu() or get_platform().is_xpu or get_platform().is_hip)
             else "flashinfer"
         )
 
@@ -864,7 +874,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            is_dflash_mla_draft_config,
+        )
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         draft_hf_config = get_config(
@@ -884,10 +897,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        if is_dflash_mla_draft_config(draft_hf_config) or not (
+            all_sliding or all_causal
+        ):
             fallback_backend = get_fallback_backend()
             logger.warning(
-                "DFLASH only enables 'trtllm_mha' when all layers use sliding "
+                "DFLASH only enables 'trtllm_mha' for non-MLA drafts whose layers use sliding "
                 "attention or the draft is explicitly causal; got "
                 "layer_types=%r, is_causal=%r. "
                 "Falling back to '%s'.",

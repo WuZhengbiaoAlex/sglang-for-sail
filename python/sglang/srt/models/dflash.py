@@ -9,13 +9,11 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary import AttentionInputs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -36,19 +34,22 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_forward, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
     is_dense_head_weight,
+    is_dflash_mla_draft_config,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:
@@ -125,7 +126,15 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    tp = get_parallel().tp_size == 1
+    # Each DP rank owns different token rows. Gather only over the group on
+    # which this head is vocab-sharded, never across independent DP ranks.
+    parallel = get_parallel()
+    group = (
+        parallel.attn_tp_group
+        if getattr(lm_head, "use_attn_tp_group", False)
+        else parallel.tp_group
+    )
+    tp = group.world_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -142,13 +151,11 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = group.all_gather(vals.float(), dim=-1)
+    gathered_ids = group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
-        lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
-        )
+        lse = torch.logsumexp(group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
@@ -423,6 +430,142 @@ class DFlashAttention(nn.Module):
         return k
 
 
+class DFlashMLAAttention(DeepseekV2AttentionMLA):
+    """DFlash MLA draft with latent context KV and absorbed MLA attention.
+
+    Draft checkpoints use DeepSeek MLA parameter names. The target's existing
+    MLA implementation supplies the forward; causality, context writes and
+    the split checkpoint projections are specific to the draft.
+    """
+
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
+        if quant_config is not None:
+            raise ValueError("DFLASH mla drafts require unquantized draft weights.")
+        sliding_window_size, attn_type = _get_dflash_layer_attention_params(
+            config, layer_id
+        )
+        rope_theta, rope_scaling = get_rope_config(config)
+        if rope_scaling is not None and rope_scaling.get(
+            "rope_type", rope_scaling.get("type")
+        ) in (None, "default"):
+            rope_scaling = None
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=getattr(config, "q_lora_rank", None),
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=rope_theta,
+            # The base implementation normalizes this dict in place.
+            rope_scaling=dict(rope_scaling) if rope_scaling else None,
+            max_position_embeddings=config.max_position_embeddings,
+            layer_id=layer_id,
+            prefix=prefix,
+        )
+        # This branch's base constructor predates configurable MLA causality
+        # and windows. Apply them only to this draft's attention instances.
+        for name in ("attn_mqa", "attn_mha", "attn_mqa_for_dcp_decode"):
+            attention = getattr(self, name, None)
+            if attention is not None:
+                attention.attn_type = attn_type
+                attention.sliding_window_size = sliding_window_size or -1
+
+        if self.q_lora_rank is not None:
+            self.fused_qkv_a_proj_with_mqa.weight.weight_loader = (
+                self._load_fused_a_proj_shard
+            )
+        kv_b_proj_loader = self.kv_b_proj.weight.weight_loader
+
+        def load_kv_b_proj(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+            kv_b_proj_loader(param, loaded_weight)
+            self.absorb_kv_b_proj()
+
+        self.kv_b_proj.weight.weight_loader = load_kv_b_proj
+
+    def _load_fused_a_proj_shard(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
+    ) -> None:
+        rows = param.data.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+        )[shard_id]
+        if rows.shape != loaded_weight.shape:
+            raise ValueError(
+                f"DFLASH mla fused a_proj shard {shard_id} expects "
+                f"{tuple(rows.shape)}, got {tuple(loaded_weight.shape)}."
+            )
+        rows.copy_(loaded_weight)
+
+    def absorb_kv_b_proj(self) -> None:
+        """Build per-head K/V matrices from this rank's loaded KV-up shard."""
+        w_kc, w_vc = self.kv_b_proj.weight.unflatten(
+            0, (-1, self.qk_nope_head_dim + self.v_head_dim)
+        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.w_kc = bind_or_assign(
+            self.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        )
+        self.w_vc = bind_or_assign(self.w_vc, w_vc.contiguous().transpose(1, 2))
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        inputs = AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
+        # Scoped state also restores the enclosing target forward on failure.
+        with get_forward().scoped(attn_inputs=inputs):
+            zero_allocator = BumpAllocator(
+                buffer_size=2, dtype=torch.float32, device=hidden_states.device
+            )
+            return super().forward(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+
+    def project_context_kv(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project context into normalized latent K and rotated positional K."""
+        if self.q_lora_rank is None:
+            latent, _ = self.kv_a_proj_with_mqa(hidden_states)
+        else:
+            latent = F.linear(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight[self.q_lora_rank :],
+            )
+        k_nope = self.kv_a_layernorm(latent[..., : self.kv_lora_rank]).unsqueeze(1)
+        k_pe = latent[..., self.kv_lora_rank :].unsqueeze(1)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        return k_nope, k_pe
+
+    def write_context_kv(
+        self,
+        *,
+        pool,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write context rows, optionally only each request's committed prefix."""
+        k_nope, k_pe = self.project_context_kv(positions, hidden_states)
+        if cache_loc_2d is None:
+            # The current MLA pool accepts physical row tensors directly.
+            pool.set_mla_kv_buffer(self.attn_mqa, cache_loc, k_nope, k_pe)
+        else:
+            pool.set_mla_kv_buffer_prefix_valid(
+                self.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+            )
+
+
 class DFlashMLP(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -553,7 +696,14 @@ class DFlashDecoderLayer(nn.Module):
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         attention_prefix = f"{prefix}.self_attn" if prefix else ""
-        self.self_attn = self.attention_cls(
+        attention_cls = self.attention_cls
+        if is_dflash_mla_draft_config(config):
+            if attention_cls is not DFlashAttention:
+                raise ValueError(
+                    f"{type(self).__name__} does not support mla draft attention."
+                )
+            attention_cls = DFlashMLAAttention
+        self.self_attn = attention_cls(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -631,6 +781,10 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.rms_norm_eps = rms_norm_eps
+        self.is_mla_draft = is_dflash_mla_draft_config(config)
+        if self.is_mla_draft:
+            # MLA has latent projections, not a fused GQA qkv_proj to slice.
+            self.supports_fused_context_kv = False
         draft_config = self.draft_config = parse_dflash_draft_config(
             draft_hf_config=config
         )
@@ -826,10 +980,14 @@ class DFlashDraftModel(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+            ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
         ]
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        loaded_shards = {}
+        loaded_directly = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -873,6 +1031,7 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(resolved_name)
+                loaded_shards.setdefault(resolved_name, set()).add(shard_id)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -918,6 +1077,25 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
+                loaded_directly.add(resolved_name)
+
+        if getattr(self, "is_mla_draft", False):
+            # Unlike optional HF rotary caches, every learned MLA draft tensor
+            # is required. A single loaded half must not hide a missing shard.
+            missing = set(params_dict) - loaded_params
+            for name in params_dict:
+                if name in loaded_directly:
+                    continue
+                if name.endswith(
+                    (".gate_up_proj.weight", ".fused_qkv_a_proj_with_mqa.weight")
+                ):
+                    for shard in {0, 1} - loaded_shards.get(name, set()):
+                        missing.add(f"{name}[shard={shard}]")
+            if missing:
+                raise ValueError(
+                    "DFLASH mla checkpoint is missing required weights: "
+                    f"{sorted(missing)}."
+                )
 
         if self.projector_type == "domino":
             required = {
