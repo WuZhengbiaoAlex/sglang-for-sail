@@ -9,8 +9,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
-from torch.nn.parameter import UninitializedParameter
-
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
@@ -22,6 +20,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.incremental.config import is_enabled as is_incremental_eplb_enabled
+from sglang.srt.eplb.incremental.config import is_routed_expert_module
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -83,6 +83,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -98,6 +99,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch.nn.parameter import UninitializedParameter
 
 _is_hip = is_hip()
 _is_ppu = is_ppu()
@@ -170,9 +172,61 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _normalize_incremental_eplb_num_experts(
+    num_experts: int,
+    num_fused_shared_experts: int,
+    metadata,
+) -> int:
+    """Resolve logical routed experts to IncrementalEPLB physical storage."""
+    if num_fused_shared_experts:
+        raise ValueError("IncrementalEPLB requires --disable-shared-experts-fusion")
+
+    logical = int(metadata.num_logical_experts)
+    physical = int(metadata.num_physical_experts)
+    if num_experts == logical:
+        return physical
+    if num_experts == physical:
+        return num_experts
+    raise ValueError(
+        "IncrementalEPLB expert-count mismatch: model constructed "
+        f"{num_experts} experts, but placement metadata has "
+        f"{logical} logical and {physical} physical experts"
+    )
+
+
+def _maybe_normalize_incremental_eplb_num_experts(
+    module,
+    num_experts: int,
+    num_fused_shared_experts: int,
+) -> int:
+    """Configure routed target storage and receive counts during construction."""
+    if not is_incremental_eplb_enabled():
+        return num_experts
+
+    from sglang.srt.eplb.incremental.model_context import (
+        is_building_incremental_eplb_target,
+    )
+
+    if not is_building_incremental_eplb_target() or not is_routed_expert_module(module):
+        return num_experts
+
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        raise RuntimeError("IncrementalEPLB expert metadata is missing")
+    from sglang.srt.eplb.incremental.decode_bindings import dispatch_counts_buffer
+
+    num_experts = _normalize_incremental_eplb_num_experts(
+        num_experts, num_fused_shared_experts, metadata
+    )
+    module._incremental_eplb_counts = dispatch_counts_buffer
+    return num_experts
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
+    *,
+    routed_module: bool = True,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
@@ -197,7 +251,17 @@ def create_moe_dispatcher(
         or a2a_backend.is_pplx()
     ):
         use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get()
+        from sglang.srt.eplb.incremental.model_context import (
+            is_building_incremental_eplb_target,
+        )
+
         return MaybeTboDeepEPDispatcher(
+            layer_id=moe_runner_config.layer_id,
+            collect_incremental_eplb_stats=(
+                routed_module
+                and is_incremental_eplb_enabled()
+                and is_building_incremental_eplb_target()
+            ),
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -367,6 +431,10 @@ class FusedMoE(torch.nn.Module):
         quant_method: Optional[FusedMoEMethodBase] = None,
     ):
         super().__init__()
+        self.is_draft = get_flags().moe.in_speculative_scope
+        num_experts = _maybe_normalize_incremental_eplb_num_experts(
+            self, num_experts, num_fused_shared_experts
+        )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -547,7 +615,9 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(
-            self.moe_runner_config, quant_method=self.quant_method
+            self.moe_runner_config,
+            quant_method=self.quant_method,
+            routed_module=is_routed_expert_module(self),
         )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.

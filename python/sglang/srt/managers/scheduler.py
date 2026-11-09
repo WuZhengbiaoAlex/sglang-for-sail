@@ -6109,9 +6109,19 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
-                # Last: anything above may still need a working communicator.
-                abort_distributed_environment()
+                puller = getattr(
+                    scheduler.tp_worker.model_runner, "incremental_eplb_puller", None
+                )
+                if puller is not None:
+                    try:
+                        puller.close()
+                    except Exception:
+                        logger.exception("Incremental EPLB shutdown failed")
+                try:
+                    scheduler.release_host_resources()
+                finally:
+                    # Last: anything above may still need a working communicator.
+                    abort_distributed_environment()
 
 
 def _make_abort_req(

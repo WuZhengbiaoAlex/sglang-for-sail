@@ -48,6 +48,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
+from sglang.srt.eplb.incremental.config import is_enabled as is_incremental_eplb_enabled
 from sglang.srt.eplb import eplb_algorithms
 from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
 from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
@@ -202,6 +203,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_resources,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -701,11 +703,15 @@ class ModelRunner:
             )
 
     def _warmup_eplb_cpp_extensions(self):
-        if not self.server_args.enable_eplb or self.is_draft_worker:
+        if (
+            not self.server_args.enable_eplb
+            or self.is_draft_worker
+            or is_incremental_eplb_enabled()
+        ):
             return
 
-        model_config_for_expert_location = (
-            ModelConfigForExpertLocation.from_model_config(self.model_config)
+        model_config_for_expert_location = ModelConfigForExpertLocation.from_model_config(
+            self.model_config
         )
         if model_config_for_expert_location is None:
             return
@@ -756,7 +762,7 @@ class ModelRunner:
         self._warmup_eplb_cpp_extensions()
         # Load the model
         self.sampler = create_sampler()
-        self.load_model()
+        self.load_model_with_expert_placement_context()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
@@ -774,9 +780,50 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_incremental_eplb()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def load_model_with_expert_placement_context(self):
+        with contextlib.ExitStack() as stack:
+            if self.is_draft_worker:
+                from sglang.srt.layers.moe.utils import draft_expert_placement_context
+
+                stack.enter_context(draft_expert_placement_context())
+            if is_incremental_eplb_enabled():
+                from sglang.srt.eplb.incremental.model_context import (
+                    incremental_eplb_target_model_context,
+                )
+
+                stack.enter_context(
+                    incremental_eplb_target_model_context(
+                        is_target=not self.is_draft_worker
+                    )
+                )
+            self.load_model()
+
+    def maybe_init_incremental_eplb(self):
+        self.incremental_eplb_planner = None
+        self.incremental_eplb_mover = None
+        self.incremental_eplb_puller = None
+        self.incremental_eplb_decode_bindings = None
+        if not is_incremental_eplb_enabled() or self.is_draft_worker:
+            return
+
+        from sglang.srt.eplb.incremental.bootstrap import init_incremental_eplb
+
+        components = init_incremental_eplb(
+            tp_size=get_parallel().tp_size,
+            moe_ep_rank=get_parallel().moe_ep_rank,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            model=self.model,
+        )
+        self.incremental_eplb_planner = components.planner
+        self.incremental_eplb_mover = components.mover
+        self.incremental_eplb_puller = components.puller
+        self.incremental_eplb_decode_bindings = components.decode_bindings
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -791,16 +838,18 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = get_parallel().moe_ep_rank + (
-            get_parallel().ep_join_rank_offset
-            if get_exec().moe.is_ep_scale_joiner
-            else 0
+            get_parallel().ep_join_rank_offset if get_exec().moe.is_ep_scale_joiner else 0
         )
-        set_global_expert_location_metadata(
-            compute_initial_expert_location_metadata(
-                model_config=self.model_config,
-                moe_ep_rank=expert_rank,
+        metadata = compute_initial_expert_location_metadata(
+            model_config=self.model_config, moe_ep_rank=expert_rank
+        )
+        if is_incremental_eplb_enabled():
+            from sglang.srt.eplb.incremental.bootstrap import rebuild_initial_placement
+
+            metadata = rebuild_initial_placement(
+                model_config=self.model_config, meta=metadata, moe_ep_rank=expert_rank
             )
-        )
+        set_global_expert_location_metadata(metadata)
         if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
             logger.info(
                 "Initial expert_location_metadata:\n%s",
@@ -827,7 +876,9 @@ class ModelRunner:
                 get_weight_updater=lambda: self.weight_updater,
                 get_forward_pass_id=lambda: self.forward_pass_id,
             )
-            if get_exec().moe.enable_eplb and (not self.is_draft_worker)
+            if get_exec().moe.enable_eplb
+            and not is_incremental_eplb_enabled()
+            and (not self.is_draft_worker)
             else None
         )
 

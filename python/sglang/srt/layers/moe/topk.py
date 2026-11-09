@@ -91,6 +91,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.incremental.decode_bindings import route_decode_topk
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -2289,7 +2290,10 @@ def _post_process_topk_ids(
     recorder_topk_ids = None
     _fold_pad_into_append = False
     recorder_was_fused = False
-    if _is_cuda:
+    unified_routes = route_decode_topk(topk_ids, layer_id, num_token_non_padded)
+    if unified_routes is not None:
+        topk_ids = unified_routes
+    elif _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
         log2phy_prob = None

@@ -9,6 +9,8 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
@@ -49,7 +51,6 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:
@@ -971,6 +972,12 @@ class DFlashDraftModel(nn.Module):
             next_token_logits=None,
             hidden_states=hidden_states,
         )
+
+    def post_load_weights(self) -> None:
+        """Build MLA views when a loader bypasses per-parameter callbacks."""
+        if self.is_mla_draft:
+            for layer in self.layers:
+                layer.self_attn.absorb_kv_b_proj()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

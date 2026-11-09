@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -47,9 +48,8 @@ _is_ppu = is_ppu()
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 
 try:
     if _use_zbal:
@@ -76,7 +76,6 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.runtime_context import get_resources
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -442,7 +441,12 @@ class _DeepEPDispatcherImplBase:
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
-        self.num_experts = num_experts
+        expert_metadata = get_global_expert_location_metadata()
+        self.num_experts = (
+            expert_metadata.num_physical_experts
+            if expert_metadata is not None
+            else num_experts
+        )
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
@@ -457,7 +461,7 @@ class _DeepEPDispatcherImplBase:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
         if deepep_mode.enable_low_latency():
             DeepEPBuffer._state().registered_layouts.add(
-                (self.num_max_dispatch_tokens_per_rank, hidden_size, num_experts)
+                (self.num_max_dispatch_tokens_per_rank, hidden_size, self.num_experts)
             )
 
         self.handle = None
@@ -1138,6 +1142,44 @@ class _Stage(Enum):
     AFTER_COMBINE_A = auto()
 
 
+class _IncrementalEPLBDeepEPBufferProxy:
+    """IncrementalEPLB target adapter; decode-scoped callbacks are otherwise inert."""
+
+    def __init__(self, buffer, layer_id, dispatch_counts_buffer):
+        self._buffer = buffer
+        self._layer_id = layer_id
+        self._dispatch_counts_buffer = dispatch_counts_buffer
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    def low_latency_dispatch(self, *args, **kwargs):
+        kwargs["cumulative_local_expert_recv_stats"] = self._dispatch_counts_buffer(
+            self._layer_id
+        )
+        return self._buffer.low_latency_dispatch(*args, **kwargs)
+
+
+class _IncrementalEPLBDeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplLowLatency):
+    """Low-latency dispatcher variant that records expert receive counts."""
+
+    def __init__(self, layer_id: int, **kwargs):
+        super().__init__(**kwargs)
+        from sglang.srt.eplb.incremental.decode_bindings import (
+            dispatch_counts_buffer,
+        )
+
+        self._incremental_eplb_buffer = _IncrementalEPLBDeepEPBufferProxy(
+            None,
+            layer_id,
+            dispatch_counts_buffer,
+        )
+
+    def _get_buffer(self):
+        self._incremental_eplb_buffer._buffer = super()._get_buffer()
+        return self._incremental_eplb_buffer
+
+
 class DeepEPDispatcher(BaseDispatcher):
     def __init__(
         self,
@@ -1151,6 +1193,8 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        layer_id=None,
+        collect_incremental_eplb_stats=False,
     ):
         super().__init__()
 
@@ -1168,10 +1212,18 @@ class DeepEPDispatcher(BaseDispatcher):
         )
 
         if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
-                **common_kwargs,
-            )
+            if collect_incremental_eplb_stats:
+                self._low_latency_dispatcher = (
+                    _IncrementalEPLBDeepEPDispatcherImplLowLatency(
+                        layer_id=layer_id,
+                        return_recv_hook=return_recv_hook,
+                        **common_kwargs,
+                    )
+                )
+            else:
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook, **common_kwargs
+                )
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,

@@ -1172,6 +1172,7 @@ class Envs:
     # ===================================================================
     # Expert parallel load balancing
     # ===================================================================
+    SGLANG_INCREMENTAL_EPLB_DEBUG_DIR = EnvStr("")
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
     SGLANG_EPLB_ASYNC_HOST_MIRROR_REUSE_SHM = EnvBool(True)
     SGLANG_EPLB_ASYNC_HOST_MIRROR_MEMORY_LOG = EnvBool(False)

@@ -9,13 +9,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.models import dflash
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from torch import nn
-from transformers import PretrainedConfig
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -132,6 +133,39 @@ class TestDFlashMLA(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "unquantized"):
             dflash.DFlashMLAAttention(_config(), 0, quant_config=object())
 
+    def test_dummy_loader_builds_absorbed_mla_weights(self):
+        from sglang.srt.model_loader.loader import post_load_weights
+        from sglang.srt.model_loader.weight_utils import initialize_dummy_weights
+
+        attention = dflash.DFlashMLAAttention(_config(), 0)
+        model = dflash.DFlashDraftModel.__new__(dflash.DFlashDraftModel)
+        nn.Module.__init__(model)
+        model.is_mla_draft = True
+        layer = nn.Module()
+        layer.self_attn = attention
+        model.layers = nn.ModuleList([layer])
+        with torch.no_grad():
+            initialize_dummy_weights(model)
+            self.assertIsNone(attention.w_kc)
+            post_load_weights(model)
+            weight = attention.kv_b_proj.weight.view(2, 5, 2)
+            torch.testing.assert_close(attention.w_kc, weight[:, :2])
+            torch.testing.assert_close(attention.w_vc, weight[:, 2:].transpose(1, 2))
+            pointers = attention.w_kc.data_ptr(), attention.w_vc.data_ptr()
+            attention.kv_b_proj.weight.add_(1)
+            post_load_weights(model)
+            self.assertEqual(
+                pointers, (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
+            )
+            torch.testing.assert_close(attention.w_kc, weight[:, :2])
+
+    def test_post_load_does_not_absorb_gqa_weights(self):
+        model = dflash.DFlashDraftModel.__new__(dflash.DFlashDraftModel)
+        nn.Module.__init__(model)
+        model.is_mla_draft = False
+        model.layers = [SimpleNamespace(self_attn=object())]
+        model.post_load_weights()
+
     def test_checkpoint_names_load_split_a_and_absorbed_kv(self):
         attention = dflash.DFlashMLAAttention(_config(), 0)
         model = dflash.DFlashDraftModel.__new__(dflash.DFlashDraftModel)
@@ -230,10 +264,13 @@ class TestDFlashMLA(CustomTestCase):
 
     def test_five_layer_block5_uses_mla_and_six_context_features(self):
         # No accelerator linear/norm construction; keep model layout and selector real.
-        with mock.patch.object(
-            dflash, "RMSNorm", side_effect=lambda *a, **kw: nn.Identity()
-        ), mock.patch.object(
-            dflash, "DFlashMLP", side_effect=lambda *a, **kw: nn.Identity()
+        with (
+            mock.patch.object(
+                dflash, "RMSNorm", side_effect=lambda *a, **kw: nn.Identity()
+            ),
+            mock.patch.object(
+                dflash, "DFlashMLP", side_effect=lambda *a, **kw: nn.Identity()
+            ),
         ):
             model = dflash.DFlash2DraftModel(_config())
         self.assertEqual(len(model.layers), 5)
@@ -247,14 +284,18 @@ class TestDFlashMLA(CustomTestCase):
             self.assertEqual(layer.mlp_conv.block_size, 5)
 
     def test_gqa_decoder_selection_is_unchanged(self):
-        with mock.patch.object(
-            dflash, "RMSNorm", side_effect=lambda *a, **kw: nn.Identity()
-        ), mock.patch.object(
-            dflash, "DFlashMLP", side_effect=lambda *a, **kw: nn.Identity()
-        ), mock.patch.object(
-            dflash.DFlashAttention,
-            "__init__",
-            lambda self, **kw: nn.Module.__init__(self),
+        with (
+            mock.patch.object(
+                dflash, "RMSNorm", side_effect=lambda *a, **kw: nn.Identity()
+            ),
+            mock.patch.object(
+                dflash, "DFlashMLP", side_effect=lambda *a, **kw: nn.Identity()
+            ),
+            mock.patch.object(
+                dflash.DFlashAttention,
+                "__init__",
+                lambda self, **kw: nn.Module.__init__(self),
+            ),
         ):
             layer = dflash.DFlashDecoderLayer(_config(mla=False), 0)
         self.assertIsInstance(layer.self_attn, dflash.DFlashAttention)
@@ -287,10 +328,13 @@ class TestDFlashCandidateDP(CustomTestCase):
             return vals, ids, torch.logsumexp(logits, dim=-1)
 
         forbidden = mock.Mock(side_effect=AssertionError("cross-DP gather"))
-        with get_parallel().override(
-            tp_group=SimpleNamespace(world_size=8, all_gather=forbidden),
-            attn_tp_group=SimpleNamespace(world_size=2, all_gather=gather),
-        ), mock.patch.object(dflash, "lilicorr_topk_lse", local_topk_lse):
+        with (
+            get_parallel().override(
+                tp_group=SimpleNamespace(world_size=8, all_gather=forbidden),
+                attn_tp_group=SimpleNamespace(world_size=2, all_gather=gather),
+            ),
+            mock.patch.object(dflash, "lilicorr_topk_lse", local_topk_lse),
+        ):
             ids, vals, lse = dflash.candidate_topk(hidden, head, 2, with_partition=True)
         logits = hidden @ weight.T
         expected_vals, expected_ids = torch.topk(logits, 2, dim=-1)

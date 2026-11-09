@@ -64,19 +64,25 @@ def _validate_efa_allocator_compatibility(
 
 def init_mooncake_custom_mem_pool(
     device: str,
+    *,
+    custom_mem_pool_type: Optional[str] = None,
 ) -> Tuple[bool, Optional[Any], Optional[str]]:
     """
-    Initialize custom memory pool based on environment variable.
+    Initialize a requested pool, or use the configured pool when unspecified.
 
     Args:
         device: The device to allocate memory on
+        custom_mem_pool_type: Explicit pool type; otherwise read the environment
 
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool, custom_mem_pool_type = (
-        check_mooncake_custom_mem_pool_enabled()
-    )
+    if custom_mem_pool_type is None:
+        enable_custom_mem_pool, custom_mem_pool_type = (
+            check_mooncake_custom_mem_pool_enabled()
+        )
+    else:
+        enable_custom_mem_pool = True
 
     custom_mem_pool = None
 

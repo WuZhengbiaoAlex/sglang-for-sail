@@ -7,6 +7,7 @@ from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_a
 
 
 class EplbAlgorithm(Enum):
+    incremental = auto()
     deepseek = auto()
     deepseek_hierarchical = auto()
     deepseek_vec = auto()
@@ -24,6 +25,11 @@ def rebalance_experts(
     num_nodes: int,
     algorithm: EplbAlgorithm,
 ):
+    if algorithm == EplbAlgorithm.incremental:
+        raise ValueError(
+            "incremental EPLB is advanced at decode boundaries, not by the windowed rebalance API"
+        )
+
     if algorithm in [EplbAlgorithm.deepseek, EplbAlgorithm.deepseek_hierarchical]:
         return deepseek.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),

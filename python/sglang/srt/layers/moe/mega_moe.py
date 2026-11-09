@@ -20,7 +20,6 @@ from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -30,7 +29,10 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_expert_recv_stats_kwargs,
+    get_moe_a2a_backend,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
@@ -38,7 +40,6 @@ from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
-
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
@@ -298,9 +299,14 @@ def run_mega_routed_experts(
         from sglang.srt.layers.moe.ppu_mega_moe import forward
 
         y = forward(
-            experts, hidden_states, topk_ids, topk_weights,
-            hidden_size=hidden_size, intermediate_size=intermediate_size,
-            top_k=top_k, activation=experts.moe_runner_config.activation,
+            experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            activation=experts.moe_runner_config.activation,
             activation_clamp=activation_clamp,
         )
         if routed_scaling_factor != 1.0:
@@ -308,7 +314,6 @@ def run_mega_routed_experts(
         return y
 
     import deep_gemm
-
     from sglang.srt.runtime_context import get_parallel
 
     ep_group = get_parallel().moe_ep_group.device_group
@@ -419,6 +424,7 @@ def run_mega_routed_experts(
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
+            **get_expert_recv_stats_kwargs(experts),
             activation="swiglu",
             activation_clamp=activation_clamp,
             fast_math=True,
@@ -533,6 +539,15 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.w13_weight_scale_inv.format_ue8m0 = True
     experts.w2_weight_scale_inv.format_ue8m0 = True
 
+    if getattr(experts, "_incremental_eplb_counts", None) is not None:
+        experts.register_parameter(
+            "mega_w13_weight_scale_utccp",
+            torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+        )
+        experts.register_parameter(
+            "mega_w2_weight_scale_utccp",
+            torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+        )
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 

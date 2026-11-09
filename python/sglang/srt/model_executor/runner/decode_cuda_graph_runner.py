@@ -286,6 +286,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_prefill_cp = is_dsa_enable_prefill_cp() or is_mla_cp_enabled()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self._incremental_eplb_decode_bindings = getattr(
+            model_runner, "incremental_eplb_decode_bindings", None
+        )
+        self._incremental_eplb_puller = getattr(
+            model_runner, "incremental_eplb_puller", None
+        )
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
@@ -332,9 +338,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner, self.captured_req_width
         )
         if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
+            max_requests = min(self.dllm_config.max_running_requests, max(self.capture_bs))
             self.capture_bs = sorted(
                 {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
             )
@@ -349,9 +353,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.model_runner.is_draft_worker
         )
         self.capture_num_tokens: Optional[list[int]] = (
-            self._build_ragged_verify_token_buckets()
-            if self.ragged_verify_mode
-            else None
+            self._build_ragged_verify_token_buckets() if self.ragged_verify_mode else None
         )
         self._ragged_graph_size = 0
         # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
@@ -439,9 +441,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.use_ngram_embedding
                 else None
             ),
-            hc_hidden_size=getattr(
-                self.model_runner.model_config, "hc_hidden_size", None
-            ),
+            hc_hidden_size=getattr(self.model_runner.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
@@ -493,6 +493,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        if self._incremental_eplb_decode_bindings is not None:
+            debug = self._incremental_eplb_decode_bindings.balance_debug
+            if debug is not None:
+                debug.install_runner(self)
 
         # --- capture --------------------------------------------------
         try:
@@ -1038,6 +1042,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        bindings = self._incremental_eplb_decode_bindings
+        with bindings.capture() if bindings is not None else contextlib.nullcontext():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1197,9 +1206,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
-                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
-                    None
-                )
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
                 set_dp_buffer_len(
                     forward_batch.global_dp_buffer_len,
                     num_tokens,
@@ -1506,6 +1513,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        bindings = getattr(self, "_incremental_eplb_decode_bindings", None)
+        if bindings is None:
+            return self._execute(forward_batch, pp_proxy_tensors)
+        with bindings.activate():
+            return self._execute(forward_batch, pp_proxy_tensors)
+
+    def _execute(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
@@ -1534,7 +1552,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if SGLANG_PROFILE_NVTX:
                 info = self._build_decode_replay_kv_len_nvtx_msg()
                 th_nvtx_range_push(info)
+            puller = self._incremental_eplb_puller
+            if puller is not None:
+                debug = self._incremental_eplb_decode_bindings.balance_debug
+                original_bs = getattr(forward_batch, "_original_batch_size", None)
+                if debug is not None:
+                    debug.batch_size = (
+                        original_bs if original_bs is not None else forward_batch.batch_size
+                    )
+                puller.begin_step(
+                    batch_size=forward_batch.batch_size, original_batch_size=original_bs
+                )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if puller is not None:
+                puller.after_replay()
+                if debug is not None:
+                    debug.after_replay(self._replay_graph_key, puller)
             if SGLANG_PROFILE_NVTX:
                 th_nvtx_range_pop()
 

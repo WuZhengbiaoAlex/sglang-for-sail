@@ -1,7 +1,9 @@
 """PPU1.5 W4A4 MegaMoE adapter; shared experts remain outside this path."""
 
 import torch
+
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_expert_recv_stats_kwargs
 from sglang.srt.runtime_context import get_buffer, get_parallel
 
 
@@ -17,11 +19,13 @@ def prepare_weights(experts, *, activation):
         (experts.w2_weight.data, experts.w2_weight_scale.data),
         activation=activation,
     )
-    experts.mega_l1_weights, experts.mega_l2_weights = l1, l2
     # K3 sends every routed batch through MegaMoE; do not retain a duplicate
     # checkpoint layout across all layers.
     experts.w13_weight.data, experts.w13_weight_scale.data = l1
     experts.w2_weight.data, experts.w2_weight_scale.data = l2
+    # Parameter .data views do not retain transform bases after arena rebinding.
+    experts.mega_l1_weights = (experts.w13_weight.data, experts.w13_weight_scale.data)
+    experts.mega_l2_weights = (experts.w2_weight.data, experts.w2_weight_scale.data)
     experts._mega_moe_weights_built = True
     experts._mxfp4_backend = "deep_gemm"
 
@@ -91,6 +95,7 @@ def forward(
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
+        **get_expert_recv_stats_kwargs(experts),
         recipe=(1, 1, 32),
         activation=activation,
         activation_clamp=activation_clamp,

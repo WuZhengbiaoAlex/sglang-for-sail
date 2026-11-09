@@ -1141,12 +1141,17 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 
 
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
-    def __init__(self, **kwargs):
+    def __init__(self, layer_id=None, collect_incremental_eplb_stats=False, **kwargs):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
-                DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                DeepEPDispatcher(
+                    layer_id=layer_id,
+                    collect_incremental_eplb_stats=collect_incremental_eplb_stats,
+                    **kwargs,
+                )
+                for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
@@ -1162,9 +1167,7 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_pplx():
-            self._inners = [
-                PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
-            ]
+            self._inners = [PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)]
 
     @property
     def expert_mask_gpu(self):

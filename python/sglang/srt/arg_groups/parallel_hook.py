@@ -619,6 +619,14 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.eplb_algorithm == "incremental":
+        from sglang.srt.eplb.incremental.config import validate_options
+
+        validate_options(cfg)
+        declare_resolution(
+            server_args, "_handle_eplb_and_dispatch", ep_dispatch_algorithm="static"
+        )
+        return
     if cfg.enable_eplb_async:
         assert cfg.enable_eplb, (
             "EPLB async requires --enable-eplb and --enable-eplb-async to be "

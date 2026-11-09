@@ -226,6 +226,9 @@ struct MaskKernel {
     }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) {
+      return;
+    }
     const auto params = TopKParams{
         .topk_ids = static_cast<int32_t*>(topk_ids.data_ptr()),
         .ntn_ptr = ntn_ptr,
@@ -286,6 +289,9 @@ struct MaskCastInt64Kernel {
     }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) {
+      return;
+    }
     const auto params = MaskCastTopKParams{
         .in_topk_ids = static_cast<const int32_t*>(in_topk_ids.data_ptr()),
         .out_topk_ids = static_cast<int64_t*>(out_topk_ids.data_ptr()),

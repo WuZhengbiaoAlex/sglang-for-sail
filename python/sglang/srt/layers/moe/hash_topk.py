@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.incremental.decode_bindings import route_decode_topk
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
@@ -277,7 +278,10 @@ class HashTopK(nn.Module):
                 log2phy_prob = lplb_solver.solve(topk_ids)
 
         recorder_topk_ids = None
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
+        unified_routes = route_decode_topk(topk_ids, self.layer_id, num_token_non_padded)
+        if unified_routes is not None:
+            topk_ids = unified_routes
+        elif has_per_rank_fused_shared_slots(num_fused_shared_experts):
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
@@ -309,9 +313,7 @@ class HashTopK(nn.Module):
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         elif is_ppu() and topk_ids.dtype == torch.int32 and is_deepep_class_backend():
-            topk_ids = _mask_topk_ids_padded_region_to_int64(
-                topk_ids, num_token_non_padded
-            )
+            topk_ids = _mask_topk_ids_padded_region_to_int64(topk_ids, num_token_non_padded)
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
             if recorder_topk_ids is not None:
@@ -326,7 +328,5 @@ class HashTopK(nn.Module):
         )
         topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
         if is_hip():
-            _zero_topk_weights_padded_region(
-                topk_output.topk_weights, num_token_non_padded
-            )
+            _zero_topk_weights_padded_region(topk_output.topk_weights, num_token_non_padded)
         return topk_output

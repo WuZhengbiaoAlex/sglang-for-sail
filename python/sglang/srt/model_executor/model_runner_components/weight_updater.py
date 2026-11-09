@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.eplb.incremental.config import is_enabled as is_incremental_eplb_enabled
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -47,6 +48,8 @@ def _unsupported_derived_weight_cache_error(
     old weights. The check is startup-determined and rank-uniform, so an
     update never proceeds on some workers while rejected on others.
     """
+    if is_incremental_eplb_enabled():
+        return "Online weight updates require restarting without incremental EPLB"
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None

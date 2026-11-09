@@ -795,7 +795,7 @@ class ExecMoe(msgspec.Struct):
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
-    eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
+    eplb_algorithm: A[str, "Chosen EPLB algorithm; incremental rebalances at target decode boundaries"] = "auto"
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
     ] = 1000
