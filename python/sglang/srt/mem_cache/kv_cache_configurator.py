@@ -2673,6 +2673,13 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
+    # PPU native E4M3 attention reads flat FP8 rows, without packed scales.
+    if current_platform.is_ppu() and (
+        get_exec().kernel.dsa_prefill_backend == "flashmla_sparse_q8"
+        and get_exec().kernel.dsa_decode_backend == "flashmla_sparse_q8"
+    ):
+        return kv_cache_dim
+
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (

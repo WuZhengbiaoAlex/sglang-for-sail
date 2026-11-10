@@ -271,6 +271,12 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
+        if current_platform.is_ppu() and (
+            self.server_args.dsa_prefill_backend == "flashmla_sparse_q8"
+            and self.server_args.dsa_decode_backend == "flashmla_sparse_q8"
+        ):
+            return kv_cache_dim
+
         # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
         # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
         if _is_hip and (
