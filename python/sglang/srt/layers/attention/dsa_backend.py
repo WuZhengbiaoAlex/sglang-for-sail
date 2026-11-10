@@ -518,11 +518,21 @@ class DeepseekSparseAttnBackend(
         # mid-forward. `flashmla_sparse` remains the bf16 path with no such
         # requirement.
         if _is_ppu and "flashmla_sparse_q8" in (
-            self.dsa_prefill_impl, self.dsa_decode_impl
+            self.dsa_prefill_impl,
+            self.dsa_decode_impl,
         ):
-            if self.kv_cache_dtype != torch.bfloat16:
+            if self.kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
                 raise ValueError(
-                    "PPU flashmla_sparse_q8 currently requires a BF16 persistent KV cache"
+                    "PPU flashmla_sparse_q8 requires BF16 or flat E4M3 KV storage"
+                )
+            if self.kv_cache_dtype == torch.float8_e4m3fn and (
+                self.dsa_prefill_impl != "flashmla_sparse_q8"
+                or self.dsa_decode_impl != "flashmla_sparse_q8"
+                or self.kv_cache_dim != self.kv_lora_rank + self.qk_rope_head_dim
+            ):
+                raise ValueError(
+                    "PPU flat E4M3 KV requires flashmla_sparse_q8 for both prefill "
+                    "and decode, with one FP8 value per latent channel"
                 )
             from flash_mla import (
                 flash_mla_sparse_quantized_fwd,
@@ -2769,21 +2779,23 @@ class DeepseekSparseAttnBackend(
         decode: bool = False,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # The 1101 native API masks partial head tiles internally, including
-        # K3.1's six heads per TP16 rank. Keep the persistent cache BF16.
+        # Native kernels mask partial head tiles, including K3.1 TP8's 12 heads.
+        # FP8 caches are already flattened E4M3 rows; decode must reuse them.
         num_tokens, num_heads, head_dim = q_all.shape
         topk = page_table_1.shape[-1]
         if topk % 64:
-            padding = page_table_1.new_full(
-                (page_table_1.shape[0], 64 - topk % 64), -1
-            )
+            padding = page_table_1.new_full((page_table_1.shape[0], 64 - topk % 64), -1)
             page_table_1 = torch.cat((page_table_1, padding), dim=-1)
         if kv_cache.ndim == 2:
             kv_cache = kv_cache.unsqueeze(1)
         if decode:
             output, _ = self._ppu_q8_decode(
                 q=q_all,
-                kv=kv_cache.to(torch.float8_e4m3fn),
+                kv=(
+                    kv_cache
+                    if kv_cache.dtype == torch.float8_e4m3fn
+                    else kv_cache.to(torch.float8_e4m3fn)
+                ),
                 indices=page_table_1.unsqueeze(1),
                 sm_scale=sm_scale,
                 d_v=v_head_dim,

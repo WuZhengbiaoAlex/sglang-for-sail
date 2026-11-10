@@ -4598,16 +4598,22 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP TileLang FP8 consumes the model's raw MLA layout
-            # (NoPE + optional RoPE) without per-block scales.
+        if self.use_dsa and (
+            (_is_hip and self.dtype == fp8_dtype)
+            or (
+                current_platform.is_ppu()
+                and self.dtype == torch.float8_e4m3fn
+                and not self.dsa_kv_cache_store_fp8
+            )
+        ):
+            # HIP and PPU native FP8 consume raw MLA rows without block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                fp8_dtype,
+                self.dtype,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead

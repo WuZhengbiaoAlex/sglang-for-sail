@@ -350,7 +350,11 @@ def set_mla_kv_buffer_triton_fp8_quant(
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
     nope_dim = cache_k_nope.shape[-1]
-    rope_dim = cache_k_rope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1] if cache_k_rope is not None else 0
+    # NoPE-only MLA may omit the RoPE tensor. The constexpr zero width keeps
+    # the unused pointer out of all loads, including graph replay.
+    if rope_dim == 0:
+        cache_k_rope = cache_k_nope
     total_dim = nope_dim + rope_dim
     BLOCK = 128
     n_loc = loc.numel()
