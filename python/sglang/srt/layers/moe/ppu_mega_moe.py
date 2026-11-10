@@ -75,7 +75,7 @@ def forward(
             num_topk=top_k,
             hidden=hidden_size,
             intermediate_hidden=intermediate_size,
-            mma_type="fp4xfp4",
+            mma_type="mxf4xmxf4",
             activation=activation,
         )
     buf = buffers[key]
@@ -85,7 +85,13 @@ def forward(
         hidden_states,
         topk_ids.to(torch.int64).contiguous(),
         topk_weights.to(torch.float32).contiguous(),
-        buf,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        num_tokens,
+        group_size=32,
+        mma_type="mxf4xmxf4",
     )
     y = torch.empty(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device=hidden_states.device
