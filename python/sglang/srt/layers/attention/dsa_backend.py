@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -411,6 +415,8 @@ class DeepseekSparseAttnBackend(
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        # The indexer is replicated, independently of the MLA attention heads.
+        self.indexer_num_heads = get_dsa_index_n_heads(hf_config)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -453,6 +459,20 @@ class DeepseekSparseAttnBackend(
         self._is_in_tc_piecewise_cuda_graph = is_in_tc_piecewise_cuda_graph
         self._get_device_sm = get_device_sm
         self._is_blackwell = is_blackwell
+
+        self.ppu_fp8_indexer = False
+        if _is_ppu:
+            from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                is_fp4_indexer_cache_enabled,
+            )
+
+            # Match Indexer's effective dtype selection, not the main MLA KV
+            # dtype: the latter can be BF16 or FP8 independently.
+            self.ppu_fp8_indexer = (
+                get_device_sm() >= 89
+                and not envs.SGLANG_SAIL_BF16_INDEXER.get()
+                and not is_fp4_indexer_cache_enabled()
+            )
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -800,6 +820,20 @@ class DeepseekSparseAttnBackend(
         )
         return torch.cat([page_table_1, padding], dim=1), padded_top_k
 
+    def _use_ppu_grouped_paged_mqa(self, forward_mode: ForwardMode) -> bool:
+        next_n = self.speculative_num_draft_tokens
+        return (
+            _is_ppu
+            and forward_mode.is_target_verify()
+            and next_n is not None
+            and 2 <= next_n <= 6
+            and self.ppu_fp8_indexer
+            and self.indexer_num_heads == 32
+            and self.indexer_head_dim == 128
+            and self.real_page_size == 64
+            and self.dsa_index_kpool <= 1
+        )
+
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
         forward_mode: ForwardMode,
@@ -807,15 +841,21 @@ class DeepseekSparseAttnBackend(
         seqlens_expanded: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
-        # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
-        # needs a [B, next_n] schedule; everything else stays per-token.
-        # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
-        # validated; for now DG-native is SM100+ only.
+        # Group PPU FP8 verification by request so native paged MQA can reuse
+        # each K tile across the query rows. Keep the separate expanded lengths
+        # and page tables intact: TopK still needs one causal row per query.
         next_n = self.speculative_num_draft_tokens
+        if self._use_ppu_grouped_paged_mqa(forward_mode):
+            return seqlens_expanded.view(batch_size, next_n).contiguous()
+
+        # Preserve the existing SM100 schedule convention.
+        # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
+        # validated.
         if (
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
+            and not _is_ppu
             and get_platform().is_sm100
         ):
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
@@ -823,10 +863,14 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
-    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+    def _paged_mqa_schedule_metadata_extra(
+        self, seqlens_32_2d: torch.Tensor
+    ) -> Tuple[int, int, int, int]:
         return (
-            1,  # next_n
-            self.num_q_heads,  # num_heads
+            seqlens_32_2d.shape[1],  # next_n must match the native Q layout
+            # Correct the validated PPU FP8 schedule's indexer head count;
+            # leave the other dtype variants' existing metadata ABI unchanged.
+            self.indexer_num_heads if self.ppu_fp8_indexer else self.num_q_heads,
             self.indexer_head_dim,  # head_dim
             (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
         )
@@ -840,7 +884,11 @@ class DeepseekSparseAttnBackend(
             64,
             deep_gemm.get_num_sms(),
             **(
-                dict(metadata_extra=self._paged_mqa_schedule_metadata_extra())
+                dict(
+                    metadata_extra=self._paged_mqa_schedule_metadata_extra(
+                        seqlens_32_2d
+                    )
+                )
                 if _is_ppu
                 else {}
             ),
@@ -1789,6 +1837,11 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d = None
                 if (
                     self.speculative_num_draft_tokens >= 2
+                    # SM100's fused writer stores the total length in every
+                    # column. PPU uses the per-query expanded lengths instead;
+                    # the common refresh below copies those into its captured
+                    # [B, next_n] buffer in place after this kernel completes.
+                    and not _is_ppu
                     and get_platform().is_sm100
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2

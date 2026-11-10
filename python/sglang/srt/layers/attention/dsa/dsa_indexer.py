@@ -1451,7 +1451,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             if schedule_metadata is None:
                 metadata_extra = (
-                    1,  # next_n
+                    next_n if use_dg_native else 1,
                     q_probe.shape[1],  # num_heads
                     q_probe.shape[2],  # head_dim (packed for FP4)
                     1 if not self.bf16_indexer else 2,  # element size
