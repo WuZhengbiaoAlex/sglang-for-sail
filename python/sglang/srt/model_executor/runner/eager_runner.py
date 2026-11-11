@@ -391,6 +391,16 @@ class EagerRunner(BaseRunner):
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
+        # Hybrid models can own the token/head layout at their model boundary.
+        # In particular, Kimi's MM wrapper contains a causal LM rather than a
+        # bare body, and a later PP stage has no token embedding to call here.
+        if getattr(model, "handles_prefill_cp", False):
+            return model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
         input_ids = forward_batch.input_ids
         input_embeds = kwargs.get("input_embeds")
         prepare_inputs = getattr(model, "prepare_language_model_inputs", None)

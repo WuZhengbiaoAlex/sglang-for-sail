@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
-from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.kimi_linear import (
+    KimiLinearConfig,
+    kimi_linear_head_parallel,
+    kimi_linear_uses_cp_tp_group,
+)
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -34,8 +38,17 @@ from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.cp.interleave import cp_sequence_to_interleave_order
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_gather_full_sequence_states,
+    cp_shard_hidden_states,
+    cp_shard_model_inputs,
+    is_cp_active,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
+    attn_cp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_global_dp_buffer,
@@ -357,6 +370,13 @@ class KimiK3MLP(nn.Module):
         prefix_sum: Optional[torch.Tensor] = None,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if forward_batch is not None and is_cp_active(forward_batch):
+            # The dense layer's weights are TP-sharded. Every rank must reduce
+            # the same logical token rows, not unrelated interleaved CP rows.
+            full_states = cp_gather_full_sequence_states(hidden_states, forward_batch)
+            full_output = self.forward(full_states)
+            output = cp_shard_hidden_states(full_output, forward_batch)
+            return output if prefix_sum is None else output + prefix_sum
         # DP attention only when driven from the decoder layer (forward_batch
         # given); the shared-experts instance inside KimiK3MoE passes None and
         # runs on the already-gathered buffer.
@@ -1608,10 +1628,10 @@ class KimiK3DeltaAttention(nn.Module):
             else 0
         )
         self.tp_size = get_parallel().tp_size
-        # KDA is an attention layer: head-sharded params follow the
-        # attention-TP group, matching the mamba state cache sizing.
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
+        # CP shares TP ranks but partitions MLA tokens, not recurrent KDA
+        # heads. Match the state-cache geometry and gather full KDA sequences.
+        self._cp_tp_group = kimi_linear_uses_cp_tp_group()
+        self.attn_tp_size, self.attn_tp_rank = kimi_linear_head_parallel()
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -1817,7 +1837,10 @@ class KimiK3DeltaAttention(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, lambda: self.attn_tp_rank)},
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -1840,7 +1863,7 @@ class KimiK3DeltaAttention(nn.Module):
         def _a_log_weight_loader(
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
-            tp_rank = get_parallel().attn_tp_rank
+            tp_rank = self.attn_tp_rank
             shard_size = param.data.shape[2]  # local_num_heads
             start_idx = tp_rank * shard_size
 
@@ -1877,7 +1900,9 @@ class KimiK3DeltaAttention(nn.Module):
             # AR reduces in place out of a symmetric buffer, and this flag
             # would wrap the GEMM in its own symm_ctx, defeating the
             # caller-owned buffer.
-            use_dp_attention_reduce=not self.all_reduce_fusion,
+            use_dp_attention_reduce=(
+                not self.all_reduce_fusion and not self._cp_tp_group
+            ),
             prefix=f"{prefix}.o_proj",
         )
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -1885,7 +1910,7 @@ class KimiK3DeltaAttention(nn.Module):
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
-            self.o_proj.use_dp_attention_reduce = True
+            self.o_proj.use_dp_attention_reduce = not self._cp_tp_group
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2284,6 +2309,14 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        cp_active = is_cp_active(forward_batch)
+        if cp_active:
+            if not self._cp_tp_group:
+                raise ValueError("Kimi KDA CP requires TP-sharded recurrent heads")
+            # Keep each rank's physical rows, including CP tail padding, for
+            # the residual/PP boundary after the output reduce-scatter.
+            cp_local_rows = hidden_states.shape[0]
+            hidden_states = cp_gather_full_sequence_states(hidden_states, forward_batch)
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
@@ -2336,6 +2369,19 @@ class KimiK3DeltaAttention(nn.Module):
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        if cp_active:
+            # Recurrence and gated norm stay in logical sequence order. Reorder
+            # their narrow output before the row-wise projection, then sum TP
+            # partials directly into the rank-local interleave shard. The CP=TP,
+            # DP1/DCP1 topology is validated when constructing these heads.
+            gathered_rows = cp_local_rows * get_parallel().attn_cp_size
+            core_attn_out = cp_sequence_to_interleave_order(
+                core_attn_out, forward_batch, gathered_rows
+            )
+            partial, _ = self.o_proj(core_attn_out, skip_all_reduce=True)
+            output = partial.new_empty((cp_local_rows, *partial.shape[1:]))
+            attn_cp_reduce_scatter_tensor(output, partial)
+            return output
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
@@ -3308,6 +3354,8 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    handles_prefill_cp = True
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -3408,9 +3456,14 @@ class KimiK3LinearForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, embeds, pp_proxy_tensors
-        )
+        if is_cp_active(forward_batch):
+            hidden_states = self._forward_cp(
+                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+            )
+        else:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+            )
         if self.pp_group.is_last_rank:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
@@ -3423,6 +3476,53 @@ class KimiK3LinearForCausalLM(nn.Module):
                 aux_hidden_states,
             )
         return hidden_states
+
+    def _forward_cp(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ):
+        # Only the first PP stage embeds and shards the full token stream.
+        # Hidden states and the entire attention-residual bank stay CP-local
+        # on the PP wire; later stages must neither embed nor shard them again.
+        if not kimi_linear_uses_cp_tp_group():
+            raise ValueError("Kimi prefill CP requires CP=TP group sharing")
+        if self.pp_group.is_first_rank and embeds is None:
+            embeds = self.model.embed_tokens(input_ids)
+        elif not self.pp_group.is_first_rank:
+            embeds = None
+        with cp_shard_model_inputs(embeds, positions, forward_batch, input_ids) as (
+            local_embeds,
+            local_positions,
+            local_ids,
+        ):
+            hidden_states = self.model(
+                local_ids,
+                local_positions,
+                forward_batch,
+                local_embeds,
+                pp_proxy_tensors,
+            )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        stream = torch.cuda.current_stream()
+        if not self.capture_aux_hidden_states:
+            return cp_gather_after_forward(hidden_states, forward_batch, stream)
+        hidden_states, aux_hidden_states = hidden_states
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        if isinstance(aux_hidden_states, torch.Tensor):
+            aux_hidden_states = cp_gather_after_forward(
+                aux_hidden_states, forward_batch, stream
+            )
+        else:
+            aux_hidden_states = [
+                cp_gather_after_forward(aux, forward_batch, stream)
+                for aux in aux_hidden_states
+            ]
+        return hidden_states, aux_hidden_states
 
     def prepare_context_parallel_metadata_for_dcp(
         self,
@@ -3742,6 +3842,8 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    handles_prefill_cp = True
 
     @property
     def routed_experts_weights_of_layer(self):

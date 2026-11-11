@@ -60,6 +60,47 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     local_index: Optional[torch.Tensor] = None
 
 
+def is_interleave_extend(forward_batch):
+    return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
+        forward_batch.attn_cp_metadata, InterleaveContextParallelMetadata
+    )
+
+
+def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
+    """Restore interleave order after linear attention and before CP attention.
+
+    With CP2 and seven tokens, ``[t0, t1, t2, t3, t4, t5, t6]`` becomes
+    ``[t0, t2, t4, t6, t1, t3, t5, 0]``. These padded rank-major rows match
+    the boundary's reduce-scatter and the local residual/mHC rows. The reorder
+    itself performs no communication or reduction.
+    """
+    if not is_interleave_extend(forward_batch):
+        return hidden_states
+    metadata = forward_batch.attn_cp_metadata
+    if metadata.gather_index is not None:
+        padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
+        return padded.index_copy_(0, metadata.gather_index, hidden_states)
+    # One strided copy: token i lands in rank i % size's block at row i // size;
+    # only the padding rows of the last token group are zeroed.
+    size = get_parallel().attn_cp_size
+    tokens, row_shape = hidden_states.shape[0], hidden_states.shape[1:]
+    if hidden_states.is_cuda and hidden_states.is_contiguous():
+        from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+
+        return interleave_rows(hidden_states, size, gathered_rows, to_rank_major=True)
+    out = hidden_states.new_empty((gathered_rows, *row_shape))
+    blocks = out.view(size, gathered_rows // size, *row_shape)
+    groups = tokens // size
+    blocks[:, :groups].copy_(
+        hidden_states[: groups * size].view(groups, size, *row_shape).transpose(0, 1)
+    )
+    if groups < blocks.shape[1]:
+        blocks[:, groups:].zero_()
+        tail = tokens - groups * size
+        blocks[:tail, groups].copy_(hidden_states[groups * size :])
+    return out
+
+
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
@@ -173,14 +214,16 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     def gather_hidden_states(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
-        return self._gather_interleaved_tensor(x, forward_batch)
+        return self._gather_interleaved_tensor(x, forward_batch, coalesced=True)
 
     def gather_kv_cache(
         self, x: Any, forward_batch, stream: Optional[Any] = None
     ) -> Any:
         return self._gather_interleaved_tensor(x, forward_batch)
 
-    def _gather_interleaved_tensor(self, x: Any, forward_batch) -> Any:
+    def _gather_interleaved_tensor(
+        self, x: Any, forward_batch, *, coalesced: bool = False
+    ) -> Any:
         metadata = getattr(forward_batch, "attn_cp_metadata", None)
         if metadata is None:
             raise RuntimeError("Interleave CP gather requires attn_cp_metadata.")
@@ -207,8 +250,13 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
-        padded_x[:local_logical_len] = x[:local_logical_len]
+        # Full hidden-state shards already have the collective's exact layout.
+        # Keep the original padding path for partial shards and all KV gathers.
+        if coalesced and local_logical_len == physical_rank_len:
+            padded_x = x[:physical_rank_len]
+        else:
+            padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+            padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
@@ -218,6 +266,11 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         if metadata.gather_index is not None:
             return gathered.index_select(0, metadata.gather_index)
+
+        if coalesced and gathered.is_cuda and gathered.is_contiguous() and x.ndim >= 2:
+            from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+
+            return interleave_rows(gathered, self.cp_size, total_tokens)
 
         # Equal per-rank lengths: one interleave copy restores the original
         # token order; cheaper than the index_select fallback below.

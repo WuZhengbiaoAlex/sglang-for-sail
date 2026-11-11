@@ -7,6 +7,35 @@ from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStat
 from sglang.srt.runtime_context import get_parallel
 
 
+def kimi_linear_uses_cp_tp_group() -> bool:
+    """KDA shards heads over TP while MLA shards tokens over the same ranks.
+
+    Only interleave CP covering the whole TP group is supported here.  Unlike
+    MLA, a recurrent KDA head must see the entire logical sequence, including
+    its state carried from the preceding prefill chunk.
+    """
+    parallel = get_parallel()
+    if not parallel.enable_prefill_cp or parallel.attn_cp_size <= 1:
+        return False
+    if (
+        parallel.cp_strategy != "interleave"
+        or parallel.attn_cp_size != parallel.tp_size
+        or parallel.attn_dp_size != 1
+        or parallel.attn_dcp_size != 1
+    ):
+        raise ValueError(
+            "Kimi KDA prefill CP requires interleave CP=TP, DP=1 and DCP=1"
+        )
+    return True
+
+
+def kimi_linear_head_parallel() -> tuple[int, int]:
+    parallel = get_parallel()
+    if kimi_linear_uses_cp_tp_group():
+        return parallel.tp_size, parallel.tp_rank
+    return parallel.attn_tp_size, parallel.attn_tp_rank
+
+
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
     # Shared MoE utilities use the abbreviated name; checkpoints keep the original.
@@ -173,7 +202,11 @@ class KimiLinearConfig(PretrainedConfig):
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
 
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=(
+                get_parallel().tp_size
+                if kimi_linear_uses_cp_tp_group()
+                else get_parallel().attn_tp_size
+            ),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
