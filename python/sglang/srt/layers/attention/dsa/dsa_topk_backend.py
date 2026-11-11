@@ -55,6 +55,25 @@ class DSATopKBackend(Enum):
     def should_use_topk_v2(self) -> bool:
         return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
+    def can_use_paged_topk_v2(
+        self,
+        num_rows: int,
+        lengths: torch.Tensor,
+        topk: int,
+        topk_transform_method: TopkTransformMethod,
+        attn_metadata,
+        *,
+        force_unfused_topk: bool,
+    ) -> bool:
+        return (
+            not force_unfused_topk
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < topk <= 2048
+            and self.should_use_topk_v2()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and lengths.shape[0] == num_rows == attn_metadata.real_page_table.shape[0]
+        )
+
     def topk_func(
         self,
         score: torch.Tensor,
@@ -174,9 +193,6 @@ class DSATopKBackend(Enum):
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
-        if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
-
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
         # to the DeepSeek-V4 top-k v2 JIT kernel. It fuses top-k selection and the
@@ -189,16 +205,21 @@ class DSATopKBackend(Enum):
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            self.should_use_topk_v2()
-            and topk_transform_method == TopkTransformMethod.PAGED
-            and row_starts is None
+            row_starts is None
             and batch_idx_list is None
-            and 0 < topk <= 2048
-            and lengths.shape[0]
-            == logits.shape[0]
-            == attn_metadata.real_page_table.shape[0]
+            and self.can_use_paged_topk_v2(
+                logits.shape[0],
+                lengths,
+                topk,
+                topk_transform_method,
+                attn_metadata,
+                force_unfused_topk=force_unfused_topk,
+            )
         ):
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+
+        if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
+            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
         # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
         # kernel through its ragged entry point: no page table (the columns are
@@ -434,9 +455,19 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        topk_transform_paged_v2,
+        topk_transform_paged_v2_bf16,
+    )
 
     num_rows = logits.shape[0]
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+    page_table = attn_metadata.real_page_table
+    page_size = attn_metadata.page_size
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    if logits.dtype == torch.bfloat16 and is_ppu():
+        topk_transform_paged_v2_bf16(logits, lengths, page_table, out, page_size)
+        return out
 
     # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
     # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
@@ -450,10 +481,6 @@ def _topk_transform_v2_paged(
     ), (
         f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
     )
-    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
-
-    page_table = attn_metadata.real_page_table
-
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
@@ -463,8 +490,6 @@ def _topk_transform_v2_paged(
         "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
     )
 
-    page_size = attn_metadata.page_size
-    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
     return out
 

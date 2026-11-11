@@ -70,6 +70,10 @@ class BaseIndexerMetadata(ABC):
         Return: batch idx for each token.
         """
 
+    def uses_paged_topk_v2(self, num_rows: int, topk: int) -> bool:
+        """Whether topk_transform with no overrides dispatches to paged v2."""
+        return False
+
     @abstractmethod
     def topk_transform(
         self,
@@ -125,6 +129,16 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def uses_paged_topk_v2(self, num_rows: int, topk: int) -> bool:
+        return self.topk_backend.can_use_paged_topk_v2(
+            num_rows,
+            self.get_seqlens_expanded(),
+            topk,
+            self.topk_transform_method,
+            self.attn_metadata,
+            force_unfused_topk=self.force_unfused_topk,
+        )
 
     def topk_transform(
         self,

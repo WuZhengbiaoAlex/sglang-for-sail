@@ -68,6 +68,15 @@ def _jit_topk_v2_module():
 
 
 @cache_once
+def _jit_topk_v2_bf16_module():
+    return load_jit(
+        make_name("topk_v2_bf16"),
+        cuda_files=["deepseek_v4/topk_v2_bf16.cuh"],
+        cuda_wrappers=[("transform_paged", "BF16PagedTopKKernel::transform_paged")],
+    )
+
+
+@cache_once
 def _jit_topk_bf16_small_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
@@ -261,6 +270,23 @@ def topk_transform_ragged_v2(
         return
     module = _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+def topk_transform_paged_v2_bf16(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Select exact BF16 top-k on PPU and map indices through the page table.
+
+    Score rows must start at 16-byte aligned addresses. Each length must be
+    between zero and the score width, with enough pages to cover that length.
+    """
+    _jit_topk_v2_bf16_module().transform_paged(
+        scores, seq_lens, page_tables, out_page_indices, page_size
+    )
 
 
 def topk_transform_paged_v2(

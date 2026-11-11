@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -556,6 +557,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
+        self.use_bf16_paged_logits = (
+            is_ppu()
+            and _is_kimi_k31_indexer_config(config)
+            and self.paged_mqa_logits_backend.is_deepgemm()
+            and envs.SGLANG_PPU_K31_BF16_PAGED_LOGITS.get()
         )
 
         # <NOTE>
@@ -1402,6 +1409,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        paged_mqa_logits = self._get_paged_mqa_logits_dispatch
+        if (
+            self.use_bf16_paged_logits
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_decode()
+            )
+            and self.use_fp8
+            and q_offset > 0
+            and metadata.uses_paged_topk_v2(q_offset, self.index_topk)
+        ):
+            paged_mqa_logits = partial(
+                deep_gemm.fp8_paged_mqa_logits, logits_dtype=torch.bfloat16
+            )
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
@@ -1596,7 +1617,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             else:
                 logits = deepgemm_paged_mqa_logits_native(
-                    self._get_paged_mqa_logits_dispatch,
+                    paged_mqa_logits,
                     q_fp8,
                     kv_cache_fp8,
                     weights,
@@ -1627,7 +1648,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             else:
                 logits = deepgemm_paged_mqa_logits_split(
-                    self._get_paged_mqa_logits_dispatch,
+                    paged_mqa_logits,
                     q_fp8,
                     kv_cache_fp8,
                     weights,
