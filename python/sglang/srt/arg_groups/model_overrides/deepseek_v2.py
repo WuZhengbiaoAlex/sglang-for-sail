@@ -1,6 +1,7 @@
 """Config-time override declarations for deepseek_v2."""
 
 import logging
+import os
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -37,6 +38,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
         is_deepseek_dsa,
         unwrap_modelopt_quantization_config,
     )
+    from sglang.srt.utils import is_ppu
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
     if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
@@ -100,7 +102,22 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     assert cfg.dp_size == 1, (
                         "interleave DSA CP does not support DP attention."
                     )
-                if "810E" not in current_platform.get_device_name():
+                experimental_kimi_cp16 = (
+                    os.environ.get("SGLANG_K31_EXPERIMENTAL_CP16") == "1"
+                    and is_ppu()
+                    and model_arch == "KimiK31ForConditionalGeneration"
+                    and cfg.nnodes == 2
+                    and cfg.pp_size == 1
+                    and cfg.tp_size == cfg.ep_size == cfg.attn_cp_size == 16
+                    and cfg.dp_size == 1
+                    and cfg.cp_strategy == "interleave"
+                )
+                if experimental_kimi_cp16:
+                    logger.warning(
+                        "Running experimental cross-node Kimi K3.1 CP16 on PPU. "
+                        "Numerical parity must be validated."
+                    )
+                elif "810E" not in current_platform.get_device_name():
                     assert cfg.tp_size <= 8, (
                         "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                     )
