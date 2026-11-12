@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_expert_recv_stats_kwargs
-from sglang.srt.runtime_context import get_buffer, get_parallel
+from sglang.srt.runtime_context import get_buffer, get_forward, get_parallel
 
 
 def prepare_weights(experts, *, activation):
@@ -26,6 +26,11 @@ def prepare_weights(experts, *, activation):
     # Parameter .data views do not retain transform bases after arena rebinding.
     experts.mega_l1_weights = (experts.w13_weight.data, experts.w13_weight_scale.data)
     experts.mega_l2_weights = (experts.w2_weight.data, experts.w2_weight_scale.data)
+    if envs.SGLANG_OPT_ULTRA_EP_PPU.get():
+        from sglang.srt.layers.moe.ppu_mega_moe_ultra_ep import register_weights
+
+        del l1, l2
+        register_weights(experts, activation=activation)
     experts._mega_moe_weights_built = True
     experts._mxfp4_backend = "deep_gemm"
 
@@ -56,10 +61,28 @@ def forward(
             f"PPU MegaMoE local tokens {num_tokens} exceed capacity {capacity}."
         )
     group = get_parallel().moe_ep_group.device_group
+    num_experts = experts.num_experts
+    routed_ids = topk_ids.to(torch.int64).contiguous()
+    weight_event = None
+    gemm_kwargs = get_expert_recv_stats_kwargs(experts)
+    ultra_ep = getattr(experts, "_ppu_mega_ultra_ep", None)
+    if ultra_ep is not None and get_forward().is_extend_in_batch:
+        from sglang.srt.layers.moe.ppu_mega_moe_ultra_ep import prepare_prefill
+
+        # UltraEP can reroute IDs in place. Preserve the model's logical IDs.
+        if routed_ids is topk_ids:
+            routed_ids = routed_ids.clone()
+        routed_ids, weight_event = prepare_prefill(experts, routed_ids)
+        num_experts = ultra_ep.num_global_physical_experts
+        replica = ultra_ep.replica_weight_pool()
+        gemm_kwargs = {
+            "l1_weights_replicas": (replica.w1, replica.w1_scale),
+            "l2_weights_replicas": (replica.w2, replica.w2_scale),
+        }
     key = (
         id(group),
         hidden_states.device,
-        experts.num_experts,
+        num_experts,
         capacity,
         top_k,
         hidden_size,
@@ -70,7 +93,7 @@ def forward(
     if key not in buffers:
         buffers[key] = deep_gemm.get_symm_buffer_for_mega_moe(
             group,
-            num_experts=experts.num_experts,
+            num_experts=num_experts,
             num_max_tokens_per_rank=capacity,
             num_topk=top_k,
             hidden=hidden_size,
@@ -83,7 +106,7 @@ def forward(
     # in final combine. It owns all scratch/counter recycling, including graphs.
     deep_gemm.mega_moe_pre_dispatch(
         hidden_states,
-        topk_ids.to(torch.int64).contiguous(),
+        routed_ids,
         topk_weights.to(torch.float32).contiguous(),
         buf.x,
         buf.x_sf,
@@ -96,12 +119,14 @@ def forward(
     y = torch.empty(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device=hidden_states.device
     )
+    if weight_event is not None:
+        weight_event.current_stream_wait()
     deep_gemm.fp4_fp4_mega_moe(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        **get_expert_recv_stats_kwargs(experts),
+        **gemm_kwargs,
         recipe=(1, 1, 32),
         activation=activation,
         activation_clamp=activation_clamp,
