@@ -5,7 +5,14 @@ import logging
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_disagg,
+    get_exec,
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -14,22 +21,32 @@ def register_weights(experts, *, activation):
     """Put each layer's masters in symmetric memory and share one replica pool."""
     from ultra_ep import ppu
 
-    args = get_server_args()
+    moe = get_exec().moe
+    spec_algorithm = get_spec().speculative_algorithm
+    # PD prefill only uses DFlash to materialize prompt KV from target hiddens.
+    # Its dense draft never registers experts. Reject any MoE draft build here:
+    # target and draft layers must not share this manager / replica pool.
+    pd_dflash_target = (
+        get_disagg().disaggregation_mode == "prefill"
+        and spec_algorithm == "DFLASH"
+        and not get_flags().moe.in_speculative_scope
+    )
     if (
         activation != "situ"
-        or args.enable_eplb
-        or args.enable_eplb_async
-        or args.ep_dispatch_algorithm is not None
-        or args.ep_num_redundant_experts
-        or args.init_expert_location != "trivial"
-        or args.expert_distribution_recorder_mode is not None
-        or args.enable_two_batch_overlap
-        or args.speculative_algorithm is not None
+        or moe.enable_eplb
+        or moe.enable_eplb_async
+        or moe.ep_dispatch_algorithm is not None
+        or moe.ep_num_redundant_experts
+        or moe.init_expert_location != "trivial"
+        or moe.expert_distribution_recorder_mode is not None
+        or get_exec().overlap.enable_two_batch_overlap
+        or (spec_algorithm is not None and not pd_dflash_target)
         or experts.num_fused_shared_experts
     ):
         raise ValueError(
             "PPU UltraEP prefill requires SiTU MegaMoE with ordinary contiguous "
-            "expert ownership, separate shared experts and no speculative draft"
+            "expert ownership, separate shared experts and either no speculative "
+            "draft or PD-prefill DFLASH with a dense draft"
         )
 
     group = get_parallel().moe_ep_group.device_group

@@ -212,4 +212,11 @@ class KimiLinearConfig(PretrainedConfig):
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
 
-        return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+        return KimiLinearCacheParams(
+            shape=shape,
+            layers=self.linear_layer_ids,
+            # KDA heads follow the CP=TP group, while MLA attention TP is 1.
+            # Mooncake must aggregate CP state shards instead of treating
+            # every CP rank as a replica of a complete attention-TP state.
+            state_shard_on_attn_cp=kimi_linear_uses_cp_tp_group(),
+        )
