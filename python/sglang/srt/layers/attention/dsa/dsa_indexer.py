@@ -32,6 +32,13 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    _topk_transform_v2_logical,
+)
+from sglang.srt.layers.attention.dsa.indexer_request_sharding import (
+    IndexerRequestShardMetadata,
+    map_logical_topk_to_physical,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -1488,6 +1495,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        request_shard = getattr(metadata, "indexer_request_shard", None)
+        if request_shard is not None:
+            # Metadata selects this branch uniformly within an attention-TP
+            # group, including ranks whose request shard contains only padding.
+            # Do not silently fall back on one rank once a collective is planned.
+            assert (
+                is_ppu()
+                and use_dg_native
+                and not self.use_fp4
+                and not self.bf16_indexer
+                and not self.use_int8
+                and not metadata.force_unfused_topk
+                and q_probe.shape[1:] == (32, 128)
+                and page_size == 64
+                and B == request_shard.full_batch_size
+                and next_n == request_shard.next_n
+                and q_offset == B * next_n
+            ), "PPU verify request sharding requires grouped FP8 MQA and fused v2 TopK"
+            return self._get_topk_paged_tp_sharded(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                block_tables,
+                request_shard,
+                max_seq_len=max_seq_len,
+                page_size=page_size,
+            )
+
         # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
         def _chunked_fp8_paged_mqa_logits(
             q: torch.Tensor,
@@ -1652,6 +1687,73 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    def _get_topk_paged_tp_sharded(
+        self,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        block_tables: torch.Tensor,
+        shard: IndexerRequestShardMetadata,
+        *,
+        max_seq_len: int,
+        page_size: int = 64,
+    ) -> torch.Tensor:
+        """Serial request-sharded VERIFY indexer; return full-batch physical slots.
+
+        Projections and index-K writes have already run for the complete batch.
+        Only grouped MQA/TopK are partitioned. All ranks, including empty padded
+        shards, gather logical token positions on the current stream, then map
+        them through their own page tables. No physical addresses cross ranks.
+        """
+        group = get_parallel().attn_tp_group
+        assert group.world_size == shard.tp_size
+        assert group.rank_in_group == shard.tp_rank
+        q_offset = shard.full_batch_size * shard.next_n
+        assert q_fp8.shape[0] >= q_offset
+        assert weights.shape[0] >= q_offset
+        assert block_tables.shape[0] >= q_offset
+        start, end = shard.query_start, shard.query_end
+        local_lengths = shard.ctx_lens_2d.reshape(-1)
+        logits = deepgemm_paged_mqa_logits_native(
+            self._get_paged_mqa_logits_dispatch,
+            q_fp8[start:end],
+            kv_cache_fp8,
+            weights[start:end],
+            shard.ctx_lens_2d,
+            block_tables[start:end],
+            shard.schedule_metadata,
+            max_seq_len,
+            q_offset=end - start,
+            B=shard.local_batch_size,
+            next_n=shard.next_n,
+        )
+        self._mask_init_and_local_tokens(logits, local_lengths)
+        local_topk = _topk_transform_v2_logical(
+            logits, local_lengths, self.index_topk, shard.topk_v2_plan, page_size
+        )
+
+        # Each invocation owns its output. During graph capture these allocations
+        # are recorded in the graph pool, avoiding a mutable cross-layer scratch
+        # buffer that could overwrite indices still consumed by another stream.
+        logical_topk = local_topk.new_empty((q_offset, self.index_topk))
+        group.all_gather_into_tensor(logical_topk, local_topk)
+        topk_result = map_logical_topk_to_physical(
+            logical_topk, block_tables[:q_offset], page_size
+        )
+        # DP padding of hidden states can exceed the metadata's request bucket.
+        # Keep the existing full-query output contract for downstream attention.
+        if q_fp8.shape[0] > q_offset:
+            topk_result = torch.cat(
+                [
+                    topk_result,
+                    topk_result.new_full(
+                        (q_fp8.shape[0] - q_offset, self.index_topk), -1
+                    ),
+                ],
+                dim=0,
+            )
         return topk_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
@@ -2909,5 +3011,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
-        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+        # Request sharding already gathered logical indices and resolved them
+        # through each rank's local page table. Broadcasting physical indices
+        # here would incorrectly replace that local mapping with rank 0's.
+        if getattr(metadata, "indexer_request_shard", None) is None:
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)

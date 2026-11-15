@@ -76,10 +76,14 @@ def _ppu_dsa_init_forward_metadata_in_graph(self, forward_batch):
     type=HookType.AROUND,
 )
 def _ppu_dsa_init_forward_metadata_replay_cuda_graph_from_precomputed(
-    original_fn, self, bs, precomputed, forward_mode
+    original_fn, self, bs, precomputed, forward_mode, num_padding=None
 ):
     """Skip flashmla_metadata copy on PPU."""
     flashmla_metadata = precomputed.flashmla_metadata
     precomputed.flashmla_metadata = None
-    original_fn(self, bs, precomputed, forward_mode)
-    precomputed.flashmla_metadata = flashmla_metadata
+    try:
+        return original_fn(
+            self, bs, precomputed, forward_mode, num_padding=num_padding
+        )
+    finally:
+        precomputed.flashmla_metadata = flashmla_metadata

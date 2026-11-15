@@ -398,6 +398,69 @@ def _topk_unfused(
     return topk_indices
 
 
+def _topk_transform_v2_logical(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    plan: torch.Tensor,
+    page_size: int = 64,
+) -> torch.Tensor:
+    """Select row-local token positions without mapping through a KV page table.
+
+    Returns ``(num_rows, topk)`` int32 logical positions, padded with ``-1``.
+    This uses the existing v2 kernel's no-page-table mode so callers can gather
+    selected positions across attention-TP ranks and then map them through each
+    rank's own page table. It does not gather logits or physical KV slots.
+
+    ``plan`` must be preprocessed from these exact per-query ``lengths`` for
+    this forward, with graph replay updating it in place. Lengths must be
+    non-negative and no greater than the logits width; zero denotes an inactive
+    query and produces only ``-1``. These value invariants belong to the metadata
+    producer: checking device values here would synchronize graph execution.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
+
+    assert logits.dim() == 2, "v2 logical top-k expects 2D scores"
+    num_rows = logits.shape[0]
+    # DeepGEMM may return a padded score view: its row stride may exceed width.
+    # Require the native ABI rather than copying the wide logits to contiguous.
+    assert (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), (
+        f"v2 logical top-k expects fp32 scores with unit column stride and "
+        f"16B-aligned row stride, got {logits.dtype=} {logits.stride()=}"
+    )
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+    assert (
+        lengths.dim() == 1
+        and lengths.shape[0] == num_rows
+        and lengths.dtype == torch.int32
+        and lengths.is_contiguous()
+        and lengths.device == logits.device
+    ), "v2 logical top-k requires contiguous int32 lengths[num_rows] on the scores device"
+    assert (
+        plan is not None
+        and plan.dim() == 2
+        and plan.shape == (num_rows + 1, 2)
+        and plan.dtype == torch.int32
+        and plan.is_contiguous()
+        and plan.device == logits.device
+    ), "v2 logical top-k requires a preprocessed int32 plan[num_rows + 1, 2] on the scores device"
+    assert isinstance(page_size, int) and page_size > 0 and not (
+        page_size & (page_size - 1)
+    ), f"v2 top-k requires a power-of-two page size, got {page_size=}"
+
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    if num_rows == 0:
+        return out
+    topk_transform_paged_v2(
+        logits, lengths, None, out, page_size, plan, out_raw_indices=None
+    )
+    return out
+
+
 def _topk_transform_v2_paged(
     logits: torch.Tensor,
     lengths: torch.Tensor,

@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.indexer_request_sharding import (
+    IndexerRequestShardMetadata,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa_backend import DSAMetadata
@@ -98,6 +101,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    indexer_request_shard: Optional[IndexerRequestShardMetadata] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32

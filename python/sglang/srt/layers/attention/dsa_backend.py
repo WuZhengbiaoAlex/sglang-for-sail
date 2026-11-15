@@ -70,6 +70,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.indexer_request_sharding import (
+    IndexerRequestShardMetadata,
+)
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
@@ -296,6 +299,9 @@ class DSAMetadata:
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
+    # Local request partition, built once per forward and shared across layers.
+    # CUDA graph replay refreshes all three tensors without changing data_ptr.
+    indexer_request_shard: Optional[IndexerRequestShardMetadata] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -520,6 +526,7 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
         self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        self.indexer_request_sharding_enabled = envs.SGLANG_PPU_DSA_VERIFY_TP_SHARD.get()
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -954,6 +961,129 @@ class DeepseekSparseAttnBackend(
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
+    def _use_indexer_request_sharding(
+        self, forward_mode: ForwardMode, batch_size: int
+    ) -> bool:
+        # This predicate depends only on capture/static topology and geometry,
+        # never on an individual rank's live sequence lengths or work count.
+        if not (
+            getattr(self, "indexer_request_sharding_enabled", False)
+            and self._use_ppu_grouped_paged_mqa(forward_mode)
+            and batch_size in (16, 32, 64, 128, 256)
+            and 0 < self.dsa_index_topk <= 2048
+            and self.dsa_index_kpool == 1
+            and self.use_fused_topk
+            and self.dsa_topk_backend.should_use_topk_v2()
+            and self.hisparse_coordinator is None
+            and get_exec().kernel.dsa_paged_mqa_logits_backend in ("auto", "deepgemm")
+        ):
+            return False
+        parallel = get_parallel()
+        return (
+            parallel.attn_tp_size == 8
+            and parallel.pp_size == 1
+            and parallel.attn_cp_size == 1
+            and parallel.attn_dcp_size == 1
+        )
+
+    @staticmethod
+    def _indexer_shard_context_lengths(
+        seqlens_expanded: torch.Tensor,
+        full_batch_size: int,
+        next_n: int,
+        tp_rank: int,
+        tp_size: int,
+        num_padding: int,
+    ) -> torch.Tensor:
+        # num_padding counts requests, not query rows. The graph runner pads
+        # seq_lens with 1, so inspecting lengths cannot identify padded requests.
+        if not 0 <= num_padding <= full_batch_size:
+            raise ValueError("Indexer shard padding must be a valid request count")
+        local_bs = full_batch_size // tp_size
+        request_start = tp_rank * local_bs
+        ctx = seqlens_expanded.view(full_batch_size, next_n)[
+            request_start : request_start + local_bs
+        ].clone()
+        valid_local_bs = max(
+            0, min(local_bs, full_batch_size - num_padding - request_start)
+        )
+        if valid_local_bs < local_bs:
+            ctx[valid_local_bs:].zero_()
+        return ctx
+
+    def _build_indexer_request_shard(
+        self,
+        forward_mode: ForwardMode,
+        batch_size: int,
+        seqlens_expanded: torch.Tensor,
+        *,
+        in_capture: bool = False,
+        num_padding: int = 0,
+    ) -> Optional[IndexerRequestShardMetadata]:
+        if not self._use_indexer_request_sharding(forward_mode, batch_size):
+            return None
+        parallel = get_parallel()
+        next_n = self.speculative_num_draft_tokens
+        ctx = self._indexer_shard_context_lengths(
+            seqlens_expanded,
+            batch_size,
+            next_n,
+            parallel.attn_tp_rank,
+            parallel.attn_tp_size,
+            num_padding,
+        )
+        # Reserve the native scheduler's largest-context shape before capture.
+        # Replay copies fresh schedules into this allocation, never rebinds it.
+        schedule_ctx = (
+            torch.full_like(ctx, self.req_to_token.shape[1]) if in_capture else ctx
+        )
+        plan = self._build_topk_v2_plan(ctx.flatten())
+        assert plan is not None
+        return IndexerRequestShardMetadata(
+            full_batch_size=batch_size,
+            next_n=next_n,
+            tp_rank=parallel.attn_tp_rank,
+            tp_size=parallel.attn_tp_size,
+            ctx_lens_2d=ctx,
+            schedule_metadata=self._build_paged_mqa_schedule_metadata(schedule_ctx),
+            topk_v2_plan=plan,
+        )
+
+    def _refresh_indexer_request_shard(
+        self, metadata: DSAMetadata, *, num_padding: int
+    ) -> None:
+        shard = metadata.indexer_request_shard
+        if shard is None:
+            return
+        ctx = self._indexer_shard_context_lengths(
+            metadata.dsa_seqlens_expanded,
+            shard.full_batch_size,
+            shard.next_n,
+            shard.tp_rank,
+            shard.tp_size,
+            num_padding,
+        )
+        shard.ctx_lens_2d.copy_(ctx)
+        schedule = self._build_paged_mqa_schedule_metadata(shard.ctx_lens_2d)
+        captured = shard.schedule_metadata
+        if (
+            captured.ndim != schedule.ndim
+            or captured.shape[1:] != schedule.shape[1:]
+            or captured.shape[0] < schedule.shape[0]
+        ):
+            raise RuntimeError(
+                "Indexer request shard schedule exceeds its captured capacity: "
+                f"captured={tuple(captured.shape)}, replay={tuple(schedule.shape)}"
+            )
+        if captured.shape == schedule.shape:
+            captured.copy_(schedule)
+        else:
+            captured.zero_()
+            captured[: schedule.shape[0]].copy_(schedule)
+        plan = self._build_topk_v2_plan(shard.ctx_lens_2d.flatten())
+        assert plan is not None and plan.shape == shard.topk_v2_plan.shape
+        shard.topk_v2_plan.copy_(plan)
+
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
@@ -1010,6 +1140,7 @@ class DeepseekSparseAttnBackend(
             spec_info=forward_batch.spec_info,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
+            num_padding=getattr(forward_batch, "num_padding", 0) or 0,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1353,6 +1484,12 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            indexer_request_shard=self._build_indexer_request_shard(
+                forward_batch.forward_mode,
+                forward_batch.batch_size,
+                seqlens_expanded,
+                num_padding=getattr(forward_batch, "num_padding", 0) or 0,
+            ),
         )
         metadata = self._init_kpool_metadata(
             metadata,
@@ -1738,6 +1875,9 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            indexer_request_shard=self._build_indexer_request_shard(
+                forward_mode, bs, seqlens_expanded, in_capture=True
+            ),
         )
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -1753,6 +1893,7 @@ class DeepseekSparseAttnBackend(
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional[ForwardMode] = None,
+        num_padding: int = 0,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1771,6 +1912,9 @@ class DeepseekSparseAttnBackend(
                 spec_info,
                 out_cache_loc,
                 actual_forward_mode,
+            )
+            self._refresh_indexer_request_shard(
+                self.forward_metadata, num_padding=num_padding
             )
             return
 
@@ -2021,6 +2165,7 @@ class DeepseekSparseAttnBackend(
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+            self._refresh_indexer_request_shard(metadata, num_padding=num_padding)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -2075,6 +2220,7 @@ class DeepseekSparseAttnBackend(
         bs: int,
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
+        num_padding: Optional[int] = None,
     ):
         """Fast path: copy precomputed metadata to this backend's metadata.
 
@@ -2088,6 +2234,17 @@ class DeepseekSparseAttnBackend(
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
+
+        if (
+            metadata.indexer_request_shard is not None
+            and not forward_mode.is_target_verify()
+        ):
+            raise ValueError("Sharded VERIFY metadata cannot replay a different mode")
+        if metadata.indexer_request_shard is not None and num_padding is None:
+            raise ValueError(
+                "Precomputed sharded VERIFY replay requires an explicit request "
+                "num_padding; padded sequence lengths cannot identify real requests"
+            )
 
         self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
 
@@ -2109,6 +2266,9 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+            self._refresh_indexer_request_shard(
+                metadata, num_padding=0 if num_padding is None else num_padding
+            )
 
         self._update_kpool_metadata_from_precomputed(
             metadata, precomputed, forward_mode
@@ -3992,6 +4152,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            indexer_request_shard=self.forward_metadata.indexer_request_shard,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
