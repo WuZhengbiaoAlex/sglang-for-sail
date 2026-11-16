@@ -1,9 +1,5 @@
 """PPU1.5 W4A4 MegaMoE adapter; shared experts remain outside this path."""
 
-import inspect
-import logging
-from functools import lru_cache
-
 import torch
 
 from sglang.srt.environ import envs
@@ -11,30 +7,38 @@ from sglang.srt.layers.moe.utils import get_expert_recv_stats_kwargs
 from sglang.srt.runtime_context import get_buffer, get_parallel
 
 
-@lru_cache(maxsize=16)
-def _supports_logical_expert_count(kernel):
-    try:
-        supported = "num_logical_experts" in inspect.signature(kernel).parameters
-    except (TypeError, ValueError):
-        supported = False
-    if not supported:
-        logging.getLogger(__name__).warning(
-            "DeepGEMM lacks logical-expert workload tuning; incremental EPLB "
-            "will retain capacity-based MegaMoE kernel selection."
-        )
-    return supported
+def _record_kernel_workload(experts, deep_gemm, buf, num_tokens, gemm_kwargs):
+    if not gemm_kwargs:
+        return
+    from sglang.srt.eplb.incremental.decode_bindings import (
+        record_workload,
+        recording_workload,
+    )
 
+    if not recording_workload():
+        return
+    query = getattr(deep_gemm, "get_mega_moe_kernel_config", None)
+    if query is None:
+        return
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.eplb.incremental.config import PPU_MEGAMOE_COST_PROFILES
 
-def _get_mega_moe_kwargs(experts, kernel):
-    kwargs = get_expert_recv_stats_kwargs(experts)
-    if kwargs and _supports_logical_expert_count(kernel):
-        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-
-        # The counter is bound only during incremental target decode.
-        kwargs["num_logical_experts"] = (
-            get_global_expert_location_metadata().num_logical_experts
-        )
-    return kwargs
+    config = query(buf, num_tokens)
+    logical = get_global_expert_location_metadata().num_logical_experts
+    rows = config["l1_block_m"]
+    key = (
+        buf.group.size(),
+        logical,
+        buf.num_topk,
+        buf.hidden,
+        buf.intermediate_hidden,
+        num_tokens,
+        rows,
+    )
+    calibration = PPU_MEGAMOE_COST_PROFILES.get(key)
+    if calibration is not None:
+        cost, gain_divisor = calibration
+        record_workload(experts.layer_id, (rows, cost, gain_divisor))
 
 
 def prepare_weights(experts, *, activation):
@@ -126,12 +130,14 @@ def forward(
     y = torch.empty(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device=hidden_states.device
     )
+    gemm_kwargs = get_expert_recv_stats_kwargs(experts)
+    _record_kernel_workload(experts, deep_gemm, buf, num_tokens, gemm_kwargs)
     deep_gemm.fp4_fp4_mega_moe(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        **_get_mega_moe_kwargs(experts, deep_gemm.fp4_fp4_mega_moe),
+        **gemm_kwargs,
         recipe=(1, 1, 32),
         activation=activation,
         activation_clamp=activation_clamp,

@@ -1256,13 +1256,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # `out_cache_loc_full_physical` -> KVWriteLoc.full_loc), so the runner
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
-            with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                    attention_variant,
-                )
+            shape_key = self._make_graph_key(
+                self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                stream_idx,
+                variant_label,
+                attention_variant,
+            )
+            bindings = self._incremental_eplb_decode_bindings
+            workload_ctx = (
+                bindings.capture_workload(shape_key)
+                if bindings is not None
+                else contextlib.nullcontext()
+            )
+            with canary_ctx, workload_ctx:
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
                     attn_backend,
@@ -1561,7 +1567,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         original_bs if original_bs is not None else forward_batch.batch_size
                     )
                 puller.begin_step(
-                    batch_size=forward_batch.batch_size, original_batch_size=original_bs
+                    batch_size=forward_batch.batch_size,
+                    original_batch_size=original_bs,
+                    cost_profile=self._incremental_eplb_decode_bindings.workload_for(
+                        self._replay_graph_key,
+                        getattr(forward_batch, "original_global_num_tokens_cpu", None)
+                        or forward_batch.global_num_tokens_cpu,
+                    ),
                 )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if puller is not None:

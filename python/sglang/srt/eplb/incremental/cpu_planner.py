@@ -41,7 +41,9 @@ class LoadHistory:
         if self.count == 0 and not tokens.any().item():
             return tokens
         if self.samples is None:
-            self.samples = torch.empty((self.size, *tokens.shape), dtype=tokens.dtype)
+            self.samples = torch.empty(
+                (self.size, *tokens.shape), dtype=tokens.dtype, device="cpu"
+            )
             self.total = torch.zeros_like(tokens)
             self.mean = torch.empty_like(tokens)
         if self.count == self.size:
@@ -78,6 +80,7 @@ class CpuPlanner:
         merge_numerator,
         merge_denominator,
         gain_divisor,
+        cost_profile=None,
     ):
         if threading.current_thread() is threading.main_thread():
             raise RuntimeError("CPU planner must execute in the background worker")
@@ -135,8 +138,14 @@ class CpuPlanner:
         self.ready.record(torch.cuda.current_stream())
         # This also drains the preceding upload before its pinned buffers are reused.
         self.ready.synchronize()
+        mean = self.history.update(self.inputs[0])
+        history = (
+            self.history.samples[: self.history.count]
+            if cost_profile is not None and self.history.count
+            else None
+        )
         return self.library.plan_into(
-            self.history.update(self.inputs[0]),
+            mean,
             *self.inputs[1:],
             *self.outputs,
             ranks,
@@ -149,6 +158,8 @@ class CpuPlanner:
             merge_denominator,
             gain_divisor,
             self.threads,
+            history,
+            cost_profile,
         )
 
     def stage(self, placement, owners, pulls, experts, rank):

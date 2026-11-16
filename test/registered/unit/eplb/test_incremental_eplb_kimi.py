@@ -203,11 +203,14 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
 
     stats = torch.zeros(14, dtype=torch.int32) if active else None
     compute, dispatch = Mock(), Mock()
+    workspace = SimpleNamespace(
+        x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+    )
     monkeypatch.setitem(
         sys.modules,
         "deep_gemm",
         SimpleNamespace(
-            get_symm_buffer_for_mega_moe=Mock(return_value=object()),
+            get_symm_buffer_for_mega_moe=Mock(return_value=workspace),
             mega_moe_pre_dispatch=dispatch,
             fp4_fp4_mega_moe=compute,
         ),
@@ -218,7 +221,8 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
         "forward",
         dict(
             torch=torch,
-            _get_mega_moe_kwargs=lambda experts, kernel: (
+            _record_kernel_workload=lambda *args: None,
+            get_expert_recv_stats_kwargs=lambda experts: (
                 {"cumulative_local_expert_recv_stats": stats}
                 if stats is not None
                 else {}
@@ -256,8 +260,16 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
         )
         if not active:
             assert "cumulative_local_expert_recv_stats" not in compute.call_args.kwargs
+        assert "num_logical_experts" not in compute.call_args.kwargs
         assert compute.call_args.args[1] is experts.mega_l1_weights
+        assert compute.call_args.args[3] is workspace
         assert dispatch.call_args.args[1].dtype == torch.int64
+        assert dispatch.call_args.args[3:7] == (
+            workspace.x,
+            workspace.x_sf,
+            workspace.topk_idx,
+            workspace.topk_weights,
+        )
 
 
 def test_megamoe_diagnostics_reports_delta_and_skips_prefill():

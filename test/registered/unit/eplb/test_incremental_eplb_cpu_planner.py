@@ -356,3 +356,104 @@ def test_balanced_ranks_do_not_split_just_to_meet_threshold(native):
     assert torch.equal(output, resident)
     assert torch.equal(routes, owners)
     assert (copies == -1).all()
+
+
+def cost_plan(native, tokens, resident, owners, history=None, profile=None, threads=4):
+    out = [torch.empty_like(t) for t in (resident, owners, resident)]
+    ranks = owners.shape[-1]
+    native.plan_into(
+        tokens,
+        resident,
+        owners,
+        *out,
+        ranks,
+        2,
+        32,
+        min(8, ranks),
+        3,
+        5,
+        2,
+        5,
+        50,
+        threads,
+        history,
+        profile,
+    )
+    check_placement(resident, owners, *out)
+    return out
+
+
+def test_profile_zero_preserves_token_planner(native):
+    tokens, resident, owners = layout()
+    tokens[:, 176] = 3200
+    profile = torch.tensor([[1, 0, 1000]] * tokens.shape[0], dtype=torch.int64)
+    a = plan(native, tokens, resident, owners)
+    b = cost_plan(native, tokens, resident, owners, profile=profile)
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+def test_window_averages_cost_not_rounded_mean_tokens(native):
+    tokens, resident, owners = repair_layout([32, 32, 32, 32])
+    history = torch.tensor([[[64, 64, 32, 32]], [[0, 0, 32, 32]]], dtype=torch.int64)
+    profile = torch.tensor([[64, 384, 1000]], dtype=torch.int64)
+    current = cost_plan(native, tokens, resident, owners, profile=profile)
+    assert torch.equal(current[1], owners)
+    windowed = cost_plan(native, tokens, resident, owners, history, profile)
+    assert not torch.equal(windowed[1], owners)
+    assert int((windowed[2] >= 0).sum()) == 2
+    # Alternating experts cost224 each, always-active experts416 each.
+    loads = [0, 0]
+    for expert, weight in enumerate([224, 224, 416, 416]):
+        assert (windowed[1][0, expert] >= 0).sum() == 1
+        loads[int(windowed[1][0, expert, 0]) // 4] += weight
+    assert loads == [640, 640]
+
+
+def test_cost_window_multistep_safety_determinism_and_cold_merge(native):
+    tokens, resident, owners = layout(layers=2, ranks=64)
+    profile = torch.tensor([[64, 384, 1000], [32, 192, 1000]], dtype=torch.int64)
+    samples = []
+    for step in range(24):
+        tokens.fill_(1)
+        if step < 8:
+            tokens[:, 176] = 3200
+        samples.append(tokens.clone())
+        history = torch.stack(samples[-8:])
+        one = cost_plan(native, tokens, resident, owners, history, profile, 1)
+        four = cost_plan(native, tokens, resident, owners, history, profile, 4)
+        assert all(torch.equal(a, b) for a, b in zip(one, four))
+        resident, owners = four[:2]
+    assert (owners >= 0).sum(-1).max() == 1
+
+
+@pytest.mark.parametrize(
+    "rows,cost,gain", [(0, 384, 1000), (64, -1, 1000), (64, 384, 0)]
+)
+def test_invalid_cost_profile_rejected(native, rows, cost, gain):
+    tokens, resident, owners = layout(layers=1)
+    profile = torch.tensor([[rows, cost, gain]], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="cost profile"):
+        cost_plan(native, tokens, resident, owners, profile=profile)
+
+
+def test_cost_objective_overflow_is_rejected(native):
+    tokens, resident, owners = layout(layers=1)
+    tokens.zero_()
+    tokens[:, 0] = 1 << 24
+    profile = torch.tensor([[1, 1000000, 1000]], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="integer objective"):
+        cost_plan(native, tokens, resident, owners, profile=profile)
+
+
+def test_repair_gain_threshold_uses_same_units_as_rank_work(native):
+    tokens, resident, owners = repair_layout([32, 32, 32, 32])
+    history = torch.tensor([[[64, 64, 32, 32]], [[0, 0, 32, 32]]], dtype=torch.int64)
+    profile = torch.tensor([[64, 384, 1]], dtype=torch.int64)
+    # Rank work is 448/832, despite equal token totals. Swapping owners would
+    # save less than mean_rank_work**2 per copy, so this policy must reject it.
+    output, routes, copies = cost_plan(
+        native, tokens, resident, owners, history, profile
+    )
+    assert torch.equal(routes, owners)
+    assert torch.equal(output, resident)
+    assert (copies == -1).all()
