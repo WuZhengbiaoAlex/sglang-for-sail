@@ -218,6 +218,7 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
         "forward",
         dict(
             torch=torch,
+            _record_kernel_workload=lambda *args: None,
             _get_mega_moe_kwargs=lambda experts, kernel: (
                 {"cumulative_local_expert_recv_stats": stats}
                 if stats is not None

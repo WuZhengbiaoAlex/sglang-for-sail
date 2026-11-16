@@ -17,6 +17,15 @@ MAX_OWNER_MOVES_PER_LAYER_PER_STEP = 32
 EXCHANGE_GAIN_DIVISOR = 50
 
 
+# M890 MXFP4 MegaMoE calibration: (EP, logical experts, top-k, H, I,
+# padded local tokens, selected L1 block-M) -> (block cost in token units,
+# gain divisor). This entry covers K3.1 EP64, DFlash width5, batch32/DP.
+# Unsupported geometries retain token-only planning. The backend selects block-M.
+PPU_MEGAMOE_COST_PROFILES = {
+    (64, 896, 16, 3584, 3072, 20, 64): (384, 1000),
+}
+
+
 def is_enabled(config=None) -> bool:
     if config is None:
         from sglang.srt.runtime_context import get_exec

@@ -113,6 +113,7 @@ class IncrementalPlanner:
             raise ValueError(f"EP rank {ep_rank} is outside EP size {ep_size}")
         if device.type != "cuda":
             raise ValueError(f"IncrementalEPLB requires a CUDA device, got {device}")
+        self.cost_profile = None
         self.L = num_layers
         self.E = num_logical_experts
         self.P = num_physical_experts
@@ -393,6 +394,7 @@ class IncrementalPlanner:
             self.merge_target.numerator,
             self.merge_target.denominator,
             policy.EXCHANGE_GAIN_DIVISOR,
+            self.cost_profile,
         )
 
     def _plan_and_publish(self):
