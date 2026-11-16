@@ -795,7 +795,9 @@ class ExecMoe(msgspec.Struct):
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
-    eplb_algorithm: A[str, "Chosen EPLB algorithm; incremental rebalances at target decode boundaries"] = "auto"
+    eplb_algorithm: A[
+        str, "Chosen EPLB algorithm; incremental rebalances at target decode boundaries"
+    ] = "auto"
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
     ] = 1000
@@ -813,7 +815,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     expert_distribution_recorder_buffer_size: A[
         Optional[int],
-        "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer. Incremental EPLB uses this as a finite decode-load history (default: 1) and still plans every decode step.",
     ] = None
     expert_balancedness_report_mode: A[
         Literal["off", "server_log", "prometheus", "both"],

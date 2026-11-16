@@ -1,10 +1,40 @@
 """PPU1.5 W4A4 MegaMoE adapter; shared experts remain outside this path."""
 
+import inspect
+import logging
+from functools import lru_cache
+
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_expert_recv_stats_kwargs
 from sglang.srt.runtime_context import get_buffer, get_parallel
+
+
+@lru_cache(maxsize=16)
+def _supports_logical_expert_count(kernel):
+    try:
+        supported = "num_logical_experts" in inspect.signature(kernel).parameters
+    except (TypeError, ValueError):
+        supported = False
+    if not supported:
+        logging.getLogger(__name__).warning(
+            "DeepGEMM lacks logical-expert workload tuning; incremental EPLB "
+            "will retain capacity-based MegaMoE kernel selection."
+        )
+    return supported
+
+
+def _get_mega_moe_kwargs(experts, kernel):
+    kwargs = get_expert_recv_stats_kwargs(experts)
+    if kwargs and _supports_logical_expert_count(kernel):
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        # The counter is bound only during incremental target decode.
+        kwargs["num_logical_experts"] = (
+            get_global_expert_location_metadata().num_logical_experts
+        )
+    return kwargs
 
 
 def prepare_weights(experts, *, activation):
@@ -95,7 +125,7 @@ def forward(
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        **get_expert_recv_stats_kwargs(experts),
+        **_get_mega_moe_kwargs(experts, deep_gemm.fp4_fp4_mega_moe),
         recipe=(1, 1, 32),
         activation=activation,
         activation_clamp=activation_clamp,

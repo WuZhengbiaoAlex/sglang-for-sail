@@ -697,7 +697,13 @@ def handle_expert_distribution_metrics(server_args: Any):
         )
 
     if cfg.expert_distribution_recorder_buffer_size is None:
-        if (x := cfg.eplb_rebalance_num_iterations) is not None:
+        if cfg.enable_eplb and cfg.eplb_algorithm == "incremental":
+            declare_resolution(
+                server_args,
+                "_handle_expert_distribution_metrics",
+                expert_distribution_recorder_buffer_size=1,
+            )
+        elif (x := cfg.eplb_rebalance_num_iterations) is not None:
             declare_resolution(
                 server_args,
                 "_handle_expert_distribution_metrics",
