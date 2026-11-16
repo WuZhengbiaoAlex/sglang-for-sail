@@ -11,9 +11,10 @@ MAX_COPIES_PER_LAYER_PER_STEP = 2
 # Repair-phase owner relocations; a two-way exchange costs two. Split/merge
 # membership changes are separate, but share the same copy budget above.
 MAX_OWNER_MOVES_PER_LAYER_PER_STEP = 32
-# Ignore repair gains smaller than mean_rank_load**2 / this divisor.
-# Larger values admit smaller improvements (and potentially more churn).
-EXCHANGE_GAIN_DIVISOR = 1000
+# Minimum gain per new weight copy: mean_rank_load**2 / divisor.
+# Split uses squared rank loads; repair uses squared overload above its bound.
+# Resident reuse requires only a positive gain; merging follows the hysteresis.
+EXCHANGE_GAIN_DIVISOR = 50
 
 
 def is_enabled(config=None) -> bool:
@@ -31,6 +32,11 @@ def validate_options(config) -> None:
         raise ValueError("incremental EPLB owns its asynchronous placement lifecycle")
     if config.ep_dispatch_algorithm not in (None, "static"):
         raise ValueError("incremental EPLB requires --ep-dispatch-algorithm static")
+    window = getattr(config, "expert_distribution_recorder_buffer_size", None)
+    if window is not None and (type(window) is not int or not 1 <= window <= 2**31 - 1):
+        raise ValueError(
+            "incremental EPLB requires a finite positive load history window"
+        )
     if config.expert_distribution_recorder_mode is not None:
         raise ValueError(
             "incremental EPLB uses decode-only receive counts; disable the distribution recorder"

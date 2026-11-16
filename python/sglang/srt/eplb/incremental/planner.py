@@ -23,6 +23,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
+
 from . import config as policy
 from .cpu_planner import CpuPlanner
 
@@ -184,7 +186,10 @@ class IncrementalPlanner:
         ):
             raise ValueError("merge_target must be positive and below split_target")
         self.extension = load_runtime_extension()
-        self._cpu_planner = CpuPlanner(threads=policy.CPU_PLANNER_THREADS)
+        self._cpu_planner = CpuPlanner(
+            threads=policy.CPU_PLANNER_THREADS,
+            history_size=get_exec().moe.expert_distribution_recorder_buffer_size,
+        )
         self.owners = torch.full(
             (self.L, self.E, self.R), -1, dtype=torch.int32, device=self.phys.device
         )

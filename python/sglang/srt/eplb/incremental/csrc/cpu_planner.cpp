@@ -12,6 +12,9 @@ using std::min;
 namespace {
 constexpr int MAX_E = 1024, MAX_R = 64, MAX_P = MAX_E + 2 * MAX_R;
 constexpr int64_t MAX_TOKENS = 1LL << 24;
+int64_t max_load(const int64_t *load, int ranks) {
+  return *std::max_element(load, load + ranks);
+}
 struct Workspace {
   uint64_t old_rank_mask[MAX_E], resident_rank_mask[MAX_E];
   int resident[MAX_P], occupancy[MAX_R], copy_source[MAX_P];
@@ -122,7 +125,7 @@ void plan_split_merge(const int64_t *tokens, const int *old,
                       int *sources_out, int E, int R, int S, int budget,
                       int rpn, int numerator, int denominator,
                       int merge_numerator, int merge_denominator,
-                      int layer_offset) {
+                      int gain_divisor, int layer_offset) {
   const int P = R * S, l = layer_offset;
   tokens += l * E;
   old += l * P;
@@ -131,138 +134,151 @@ void plan_split_merge(const int64_t *tokens, const int *old,
   owners_out += l * E * R;
   sources_out += l * P;
   Workspace w;
-  if (0 == 0) {
-    int copies = 0;
-    int64_t total = 0;
-    for (int r = 0; r < R; ++r) {
-      w.load[r] = 0;
-      w.occupancy[r] = 0;
-    }
-    for (int s = 0; s < P; ++s) {
-      w.resident[s] = old[s];
-      w.selected[s] = w.protected_slot[s] = false;
-      w.copy_source[s] = -1;
-    }
-    for (int e = 0; e < E; ++e) {
-      w.old_rank_mask[e] = w.resident_rank_mask[e] = 0;
-    }
-    for (int s = 0; s < P; ++s) {
-      if (old[s] >= 0)
-        w.old_rank_mask[old[s]] |= uint64_t(1) << (s / S);
-      if (w.resident[s] >= 0)
-        w.resident_rank_mask[w.resident[s]] |= uint64_t(1) << (s / S);
-    }
-    for (int e = 0; e < E; ++e) {
-      assert(tokens[e] >= 0 && tokens[e] <= MAX_TOKENS);
+  int copies = 0;
+  int64_t total = 0;
+  for (int r = 0; r < R; ++r) {
+    w.load[r] = 0;
+    w.occupancy[r] = 0;
+  }
+  for (int s = 0; s < P; ++s) {
+    w.resident[s] = old[s];
+    w.selected[s] = w.protected_slot[s] = false;
+    w.copy_source[s] = -1;
+  }
+  for (int e = 0; e < E; ++e) {
+    w.old_rank_mask[e] = w.resident_rank_mask[e] = 0;
+  }
+  for (int s = 0; s < P; ++s) {
+    if (old[s] >= 0)
+      w.old_rank_mask[old[s]] |= uint64_t(1) << (s / S);
+    if (w.resident[s] >= 0)
+      w.resident_rank_mask[w.resident[s]] |= uint64_t(1) << (s / S);
+  }
+  for (int e = 0; e < E; ++e) {
+    assert(tokens[e] >= 0 && tokens[e] <= MAX_TOKENS);
 
-      total += tokens[e];
-      w.changed[e] = false;
-      w.head[e] = -1;
-      w.count[e] = 0;
-      for (int i = 0; i < R && old_owners[e * R + i] >= 0; ++i) {
-        int s = old_owners[e * R + i];
-        assert(s < P && old[s] == e && !w.selected[s]);
-        assert(!owns_rank(w, e, s / S, S));
-        append_owner(w, e, s);
-        w.selected[s] = w.protected_slot[s] = true;
-        ++w.occupancy[s / S];
-      }
-      assert(w.count[e] > 0);
-      for (int i = 0; i < w.count[e]; ++i)
-        w.load[owner_at(w, e, i) / S] += part(tokens[e], w.count[e], i);
+    total += tokens[e];
+    w.changed[e] = false;
+    w.head[e] = -1;
+    w.count[e] = 0;
+    for (int i = 0; i < R && old_owners[e * R + i] >= 0; ++i) {
+      int s = old_owners[e * R + i];
+      assert(s < P && old[s] == e && !w.selected[s]);
+      assert(!owns_rank(w, e, s / S, S));
+      append_owner(w, e, s);
+      w.selected[s] = w.protected_slot[s] = true;
+      ++w.occupancy[s / S];
     }
-    assert(total <= MAX_TOKENS); // Bounds the integer objective products.
-    for (int e = 0; e < E; ++e) {
-      int desired =
-          desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
-                        merge_numerator, merge_denominator);
-      if (desired >= w.count[e])
-        continue;
-      int slots[MAX_R], n = w.count[e];
+    assert(w.count[e] > 0);
+    for (int i = 0; i < w.count[e]; ++i)
+      w.load[owner_at(w, e, i) / S] += part(tokens[e], w.count[e], i);
+  }
+  assert(total <= MAX_TOKENS); // Bounds the integer objective products.
+  for (int e = 0; e < E; ++e) {
+    int desired =
+        desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
+                      merge_numerator, merge_denominator);
+    if (desired >= w.count[e])
+      continue;
+    int slots[MAX_R], n = w.count[e];
+    for (int i = 0; i < n; ++i) {
+      slots[i] = owner_at(w, e, i);
+      w.load[slots[i] / S] -= part(tokens[e], n, i);
+      w.selected[slots[i]] = false;
+      --w.occupancy[slots[i] / S];
+    }
+    // Keep the least loaded existing owners; retired storage stays pinned
+    // until the previous generation's decode and prefill reads finish.
+    for (int i = 1; i < n; ++i) {
+      int s = slots[i], j = i;
+      while (j > 0 && (w.load[slots[j - 1] / S] > w.load[s / S] ||
+                       (w.load[slots[j - 1] / S] == w.load[s / S] &&
+                        slots[j - 1] > s))) {
+        slots[j] = slots[j - 1];
+        --j;
+      }
+      slots[j] = s;
+    }
+    w.head[e] = -1;
+    w.count[e] = 0;
+    for (int i = 0; i < desired; ++i) {
+      append_owner(w, e, slots[i]);
+      w.selected[slots[i]] = true;
+      ++w.occupancy[slots[i] / S];
+      w.load[slots[i] / S] += part(tokens[e], desired, i);
+    }
+    w.changed[e] = true;
+  }
+  bool considered[MAX_E] = {};
+  for (int it = 0; it < E; ++it) {
+    int e = -1;
+    for (int j = 0; j < E; ++j)
+      if (!considered[j] &&
+          w.count[j] < desired_count(tokens[j], total, R, w.count[j], numerator,
+                                     denominator, merge_numerator,
+                                     merge_denominator) &&
+          (e < 0 || tokens[j] > tokens[e]))
+        e = j;
+    if (e < 0)
+      break;
+    considered[e] = true;
+    int desired =
+        desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
+                      merge_numerator, merge_denominator);
+    while (w.count[e] < desired) {
+      int n = w.count[e], best = -1, best_cost = 2;
+      int64_t weight = part(tokens[e], n + 1, n), released = 0;
+      int64_t after_release[MAX_R];
+      std::copy(w.load, w.load + R, after_release);
+      int64_t total_work = 0;
+      for (int r = 0; r < R; ++r)
+        total_work += w.load[r];
+      const int64_t divisor = int64_t(gain_divisor) * R * R;
+      const int64_t minimum_gain =
+          (total_work * total_work + divisor - 1) / divisor;
+      const int64_t prior_maximum = max_load(w.load, R);
       for (int i = 0; i < n; ++i) {
-        slots[i] = owner_at(w, e, i);
-        w.load[slots[i] / S] -= part(tokens[e], n, i);
-        w.selected[slots[i]] = false;
-        --w.occupancy[slots[i] / S];
+        int r = owner_at(w, e, i) / S;
+        int64_t d = part(tokens[e], n, i) - part(tokens[e], n + 1, i);
+        released += 2 * w.load[r] * d - d * d;
+        after_release[r] -= d;
       }
-      // Keep the least loaded existing owners; retired storage stays pinned
-      // until the previous generation's decode and prefill reads finish.
-      for (int i = 1; i < n; ++i) {
-        int s = slots[i], j = i;
-        while (j > 0 && (w.load[slots[j - 1] / S] > w.load[s / S] ||
-                         (w.load[slots[j - 1] / S] == w.load[s / S] &&
-                          slots[j - 1] > s))) {
-          slots[j] = slots[j - 1];
-          --j;
+      const int64_t unaffected = max_load(after_release, R);
+      int64_t best_gain = LLONG_MIN, best_maximum = LLONG_MAX;
+      for (int r = 0; r < R; ++r) {
+        if (w.occupancy[r] >= S - 1)
+          continue;
+        int cost = 0, dst = find_destination(w, e, r, S, copies, budget, cost);
+        if (dst < 0)
+          continue;
+        int64_t gain = released - 2 * w.load[r] * weight - weight * weight;
+        int64_t maximum = max(unaffected, w.load[r] + weight);
+        if (gain <= 0 || gain < minimum_gain * cost || maximum > prior_maximum)
+          continue;
+        if (best < 0 || maximum < best_maximum ||
+            (maximum == best_maximum &&
+             (gain > best_gain || (gain == best_gain && cost < best_cost)))) {
+          best = dst;
+          best_gain = gain;
+          best_cost = cost;
+          best_maximum = maximum;
         }
-        slots[j] = s;
       }
-      w.head[e] = -1;
-      w.count[e] = 0;
-      for (int i = 0; i < desired; ++i) {
-        append_owner(w, e, slots[i]);
-        w.selected[slots[i]] = true;
-        ++w.occupancy[slots[i] / S];
-        w.load[slots[i] / S] += part(tokens[e], desired, i);
-      }
-      w.changed[e] = true;
-    }
-    bool considered[MAX_E] = {};
-    for (int it = 0; it < E; ++it) {
-      int e = -1;
-      for (int j = 0; j < E; ++j)
-        if (!considered[j] &&
-            w.count[j] < desired_count(tokens[j], total, R, w.count[j],
-                                       numerator, denominator, merge_numerator,
-                                       merge_denominator) &&
-            (e < 0 || tokens[j] > tokens[e]))
-          e = j;
-      if (e < 0)
+      if (best < 0)
         break;
-      considered[e] = true;
-      int desired =
-          desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
-                        merge_numerator, merge_denominator);
-      while (w.count[e] < desired) {
-        int n = w.count[e], best = -1, best_cost = 2;
-        int64_t weight = part(tokens[e], n + 1, n), released = 0;
-        for (int i = 0; i < n; ++i) {
-          int r = owner_at(w, e, i) / S;
-          int64_t d = part(tokens[e], n, i) - part(tokens[e], n + 1, i);
-          released += 2 * w.load[r] * d - d * d;
-        }
-        int64_t best_gain = LLONG_MIN;
-        for (int r = 0; r < R; ++r) {
-          if (w.occupancy[r] >= S - 1)
-            continue;
-          int cost = 0,
-              dst = find_destination(w, e, r, S, copies, budget, cost);
-          if (dst < 0)
-            continue;
-          int64_t gain = released - 2 * w.load[r] * weight - weight * weight;
-          if (best < 0 || gain > best_gain ||
-              (gain == best_gain && cost < best_cost)) {
-            best = dst;
-            best_gain = gain;
-            best_cost = cost;
-          }
-        }
-        if (best < 0)
-          break;
-        install(w, old_owners, e, best, S, R, rpn, best_cost, copies);
-        for (int i = 0; i < n; ++i)
-          w.load[owner_at(w, e, i) / S] -=
-              part(tokens[e], n, i) - part(tokens[e], n + 1, i);
-        append_owner(w, e, best);
-        w.selected[best] = true;
-        ++w.occupancy[best / S];
-        w.load[best / S] += weight;
-        w.changed[e] = true;
-      }
+      install(w, old_owners, e, best, S, R, rpn, best_cost, copies);
+      for (int i = 0; i < n; ++i)
+        w.load[owner_at(w, e, i) / S] -=
+            part(tokens[e], n, i) - part(tokens[e], n + 1, i);
+      append_owner(w, e, best);
+      w.selected[best] = true;
+      ++w.occupancy[best / S];
+      w.load[best / S] += weight;
+      w.changed[e] = true;
     }
   }
 
-  // Write the wide owner table cooperatively; planning decisions stay serial.
+  // Publish the resident layout and active owners together.
   for (int s = 0; s < P; s++) {
     output[s] = w.resident[s];
     sources_out[s] = w.copy_source[s];
@@ -386,7 +402,7 @@ void repair_exchange(const int64_t *tokens, const int *old,
   int64_t average = (total + R - 1) / R;
   if (average > lower)
     lower = average;
-  // Skip negligible improvements that would consume the bounded copy budget.
+  // Charge repair moves per actual weight copy; resident reuse is free.
   int64_t denominator = int64_t(gain_divisor) * R * R;
   minimum_gain = (total * total + denominator - 1) / denominator;
 
@@ -416,9 +432,18 @@ void repair_exchange(const int64_t *tokens, const int *old,
         int s = src * S + job / R, dst = job % R;
         if (w.load[src] <= w.load[dst])
           continue;
+        int p = slot_part[s];
+        if (p < 0 || w.changed[p / MAX_R])
+          continue;
+        int e = p / MAX_R, i = p % MAX_R;
+        int64_t weight = slot_weight[s];
+        if (!weight)
+          continue;
         int64_t old_excess =
             excess(w.load[src], lower) + excess(w.load[dst], lower);
-        if (old_excess < minimum_gain)
+        // Presence masks can be stale, so these are conservative copy costs.
+        int minimum_ce = !(w.resident_rank_mask[e] & (uint64_t(1) << dst));
+        if (old_excess <= 0 || old_excess < minimum_gain * minimum_ce)
           continue;
         int64_t unaffected = 0;
         for (int h = 0; h < 3 && h < R; ++h) {
@@ -429,13 +454,6 @@ void repair_exchange(const int64_t *tokens, const int *old,
           }
         }
         if (best.e >= 0 && unaffected > best.maximum)
-          continue;
-        int p = slot_part[s];
-        if (p < 0 || w.changed[p / MAX_R])
-          continue;
-        int e = p / MAX_R, i = p % MAX_R;
-        int64_t weight = slot_weight[s];
-        if (!weight)
           continue;
         int ce = 0;
         int to = find_destination(w, e, dst, S, copies, budget, ce);
@@ -455,11 +473,13 @@ void repair_exchange(const int64_t *tokens, const int *old,
             continue;
           int64_t variance_gain =
               2 * delta * (w.load[src] - w.load[dst] - delta);
-          if (variance_gain <= 0 || variance_gain < minimum_gain)
+          if (variance_gain <= 0)
             continue;
           int64_t gain = old_excess - excess(w.load[src] - delta, lower) -
                          excess(w.load[dst] + delta, lower);
-          if (gain <= 0 || gain < minimum_gain)
+          int minimum_cf =
+              f >= 0 && !(w.resident_rank_mask[f] & (uint64_t(1) << src));
+          if (gain <= 0 || gain < minimum_gain * (ce + minimum_cf))
             continue;
           int64_t maximum = unaffected;
           if (w.load[src] - delta > maximum)
@@ -473,6 +493,8 @@ void repair_exchange(const int64_t *tokens, const int *old,
           int back =
               f < 0 ? -1 : find_destination(w, f, src, S, copies, budget, cf);
           if ((f >= 0 && back < 0) || copies + ce + cf > budget)
+            continue;
+          if (gain < minimum_gain * (ce + cf))
             continue;
           Exchange candidate = empty_exchange();
           candidate.e = e;
@@ -647,7 +669,8 @@ bool plan_into(torch::Tensor tokens, torch::Tensor resident,
     plan_split_merge(counts, physical, active, output.data_ptr<int>(),
                      owners_out.data_ptr<int>(), sources_out.data_ptr<int>(), E,
                      ranks, S, copy_budget, ranks_per_node, split_numerator,
-                     split_denominator, merge_numerator, merge_denominator, l);
+                     split_denominator, merge_numerator, merge_denominator,
+                     gain_divisor, l);
     repair_exchange(counts, physical, active, output.data_ptr<int>(),
                     owners_out.data_ptr<int>(), sources_out.data_ptr<int>(), E,
                     ranks, S, copy_budget, move_budget, ranks_per_node,
