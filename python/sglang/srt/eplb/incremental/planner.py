@@ -23,6 +23,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
+
 from . import config as policy
 from .cpu_planner import CpuPlanner
 
@@ -111,6 +113,7 @@ class IncrementalPlanner:
             raise ValueError(f"EP rank {ep_rank} is outside EP size {ep_size}")
         if device.type != "cuda":
             raise ValueError(f"IncrementalEPLB requires a CUDA device, got {device}")
+        self.cost_profile = None
         self.L = num_layers
         self.E = num_logical_experts
         self.P = num_physical_experts
@@ -184,7 +187,10 @@ class IncrementalPlanner:
         ):
             raise ValueError("merge_target must be positive and below split_target")
         self.extension = load_runtime_extension()
-        self._cpu_planner = CpuPlanner(threads=policy.CPU_PLANNER_THREADS)
+        self._cpu_planner = CpuPlanner(
+            threads=policy.CPU_PLANNER_THREADS,
+            history_size=get_exec().moe.expert_distribution_recorder_buffer_size,
+        )
         self.owners = torch.full(
             (self.L, self.E, self.R), -1, dtype=torch.int32, device=self.phys.device
         )
@@ -388,6 +394,7 @@ class IncrementalPlanner:
             self.merge_target.numerator,
             self.merge_target.denominator,
             policy.EXCHANGE_GAIN_DIVISOR,
+            self.cost_profile,
         )
 
     def _plan_and_publish(self):

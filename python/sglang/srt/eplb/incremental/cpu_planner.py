@@ -23,10 +23,44 @@ def load_cpu_planner():
     )
 
 
+class LoadHistory:
+    """Finite decode history, updated on the planner's background CPU thread."""
+
+    def __init__(self, size):
+        if type(size) is not int or not 1 <= size <= 2**31 - 1:
+            raise ValueError("Incremental EPLB needs a finite positive history window")
+        self.size = size
+        self.count = 0
+        self.index = 0
+        self.samples = None
+
+    def update(self, tokens):
+        if self.size == 1:
+            return tokens
+        # The first collection establishes the counter baseline, not a decode.
+        if self.count == 0 and not tokens.any().item():
+            return tokens
+        if self.samples is None:
+            self.samples = torch.empty(
+                (self.size, *tokens.shape), dtype=tokens.dtype, device="cpu"
+            )
+            self.total = torch.zeros_like(tokens)
+            self.mean = torch.empty_like(tokens)
+        if self.count == self.size:
+            self.total.sub_(self.samples[self.index])
+        self.samples[self.index].copy_(tokens)
+        self.total.add_(tokens)
+        self.count = min(self.count + 1, self.size)
+        self.index = (self.index + 1) % self.size
+        torch.div(self.total, self.count, rounding_mode="floor", out=self.mean)
+        return self.mean
+
+
 class CpuPlanner:
-    def __init__(self, *, threads):
+    def __init__(self, *, threads, history_size=1):
         if type(threads) is not int or not 1 <= threads <= 1024:
             raise ValueError("CPU planner threads must be in [1, 1024]")
+        self.history = LoadHistory(history_size)
         self.library = load_cpu_planner()
         self.threads = threads
         self.shape = None
@@ -46,6 +80,7 @@ class CpuPlanner:
         merge_numerator,
         merge_denominator,
         gain_divisor,
+        cost_profile=None,
     ):
         if threading.current_thread() is threading.main_thread():
             raise RuntimeError("CPU planner must execute in the background worker")
@@ -103,8 +138,15 @@ class CpuPlanner:
         self.ready.record(torch.cuda.current_stream())
         # This also drains the preceding upload before its pinned buffers are reused.
         self.ready.synchronize()
+        mean = self.history.update(self.inputs[0])
+        history = (
+            self.history.samples[: self.history.count]
+            if cost_profile is not None and self.history.count
+            else None
+        )
         return self.library.plan_into(
-            *self.inputs,
+            mean,
+            *self.inputs[1:],
             *self.outputs,
             ranks,
             budget,
@@ -116,6 +158,8 @@ class CpuPlanner:
             merge_denominator,
             gain_divisor,
             self.threads,
+            history,
+            cost_profile,
         )
 
     def stage(self, placement, owners, pulls, experts, rank):

@@ -7,11 +7,16 @@
 #include <cassert>
 #include <climits>
 #include <cstdint>
+#include <optional>
+#include <vector>
 using std::max;
 using std::min;
 namespace {
 constexpr int MAX_E = 1024, MAX_R = 64, MAX_P = MAX_E + 2 * MAX_R;
 constexpr int64_t MAX_TOKENS = 1LL << 24;
+int64_t max_load(const int64_t *load, int ranks) {
+  return *std::max_element(load, load + ranks);
+}
 struct Workspace {
   uint64_t old_rank_mask[MAX_E], resident_rank_mask[MAX_E];
   int resident[MAX_P], occupancy[MAX_R], copy_source[MAX_P];
@@ -59,6 +64,32 @@ int required_count(int64_t weight, int64_t total, int R, int numerator,
   return min(static_cast<int64_t>(R),
              max(int64_t(1), (demand + capacity - 1) / capacity));
 }
+struct Workload {
+  const int64_t *counts;
+  const int64_t *history;
+  int samples;
+  int64_t stride;
+  int64_t tile_rows, tile_cost;
+
+  int64_t work(int64_t tokens) const {
+    return tokens + tile_cost * ((tokens + tile_rows - 1) / tile_rows);
+  }
+  int64_t cost(int expert, int owners, int index) const {
+    if (!history || !tile_cost)
+      return work(part(counts[expert], owners, index));
+    int64_t total = 0;
+    for (int h = 0; h < samples; ++h)
+      total += work(part(history[h * stride + expert], owners, index));
+    return (total + samples / 2) / samples;
+  }
+};
+int64_t squared_load(const int64_t *load, int ranks) {
+  int64_t total = 0;
+  for (int r = 0; r < ranks; ++r)
+    total += load[r] * load[r];
+  return total;
+}
+
 int desired_count(int64_t weight, int64_t total, int R, int current,
                   int numerator, int denominator, int merge_numerator,
                   int merge_denominator) {
@@ -122,7 +153,8 @@ void plan_split_merge(const int64_t *tokens, const int *old,
                       int *sources_out, int E, int R, int S, int budget,
                       int rpn, int numerator, int denominator,
                       int merge_numerator, int merge_denominator,
-                      int layer_offset) {
+                      int gain_divisor, int layer_offset,
+                      const Workload &workload) {
   const int P = R * S, l = layer_offset;
   tokens += l * E;
   old += l * P;
@@ -131,138 +163,156 @@ void plan_split_merge(const int64_t *tokens, const int *old,
   owners_out += l * E * R;
   sources_out += l * P;
   Workspace w;
-  if (0 == 0) {
-    int copies = 0;
-    int64_t total = 0;
-    for (int r = 0; r < R; ++r) {
-      w.load[r] = 0;
-      w.occupancy[r] = 0;
-    }
-    for (int s = 0; s < P; ++s) {
-      w.resident[s] = old[s];
-      w.selected[s] = w.protected_slot[s] = false;
-      w.copy_source[s] = -1;
-    }
-    for (int e = 0; e < E; ++e) {
-      w.old_rank_mask[e] = w.resident_rank_mask[e] = 0;
-    }
-    for (int s = 0; s < P; ++s) {
-      if (old[s] >= 0)
-        w.old_rank_mask[old[s]] |= uint64_t(1) << (s / S);
-      if (w.resident[s] >= 0)
-        w.resident_rank_mask[w.resident[s]] |= uint64_t(1) << (s / S);
-    }
-    for (int e = 0; e < E; ++e) {
-      assert(tokens[e] >= 0 && tokens[e] <= MAX_TOKENS);
+  int copies = 0;
+  int64_t total = 0;
+  for (int r = 0; r < R; ++r) {
+    w.load[r] = 0;
+    w.occupancy[r] = 0;
+  }
+  for (int s = 0; s < P; ++s) {
+    w.resident[s] = old[s];
+    w.selected[s] = w.protected_slot[s] = false;
+    w.copy_source[s] = -1;
+  }
+  for (int e = 0; e < E; ++e) {
+    w.old_rank_mask[e] = w.resident_rank_mask[e] = 0;
+  }
+  for (int s = 0; s < P; ++s) {
+    if (old[s] >= 0)
+      w.old_rank_mask[old[s]] |= uint64_t(1) << (s / S);
+    if (w.resident[s] >= 0)
+      w.resident_rank_mask[w.resident[s]] |= uint64_t(1) << (s / S);
+  }
+  for (int e = 0; e < E; ++e) {
+    assert(tokens[e] >= 0 && tokens[e] <= MAX_TOKENS);
 
-      total += tokens[e];
-      w.changed[e] = false;
-      w.head[e] = -1;
-      w.count[e] = 0;
-      for (int i = 0; i < R && old_owners[e * R + i] >= 0; ++i) {
-        int s = old_owners[e * R + i];
-        assert(s < P && old[s] == e && !w.selected[s]);
-        assert(!owns_rank(w, e, s / S, S));
-        append_owner(w, e, s);
-        w.selected[s] = w.protected_slot[s] = true;
-        ++w.occupancy[s / S];
-      }
-      assert(w.count[e] > 0);
-      for (int i = 0; i < w.count[e]; ++i)
-        w.load[owner_at(w, e, i) / S] += part(tokens[e], w.count[e], i);
+    total += tokens[e];
+    w.changed[e] = false;
+    w.head[e] = -1;
+    w.count[e] = 0;
+    for (int i = 0; i < R && old_owners[e * R + i] >= 0; ++i) {
+      int s = old_owners[e * R + i];
+      assert(s < P && old[s] == e && !w.selected[s]);
+      assert(!owns_rank(w, e, s / S, S));
+      append_owner(w, e, s);
+      w.selected[s] = w.protected_slot[s] = true;
+      ++w.occupancy[s / S];
     }
-    assert(total <= MAX_TOKENS); // Bounds the integer objective products.
-    for (int e = 0; e < E; ++e) {
-      int desired =
-          desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
-                        merge_numerator, merge_denominator);
-      if (desired >= w.count[e])
-        continue;
-      int slots[MAX_R], n = w.count[e];
+    assert(w.count[e] > 0);
+    for (int i = 0; i < w.count[e]; ++i)
+      w.load[owner_at(w, e, i) / S] += workload.cost(e, w.count[e], i);
+  }
+  assert(total <= MAX_TOKENS); // Bounds the integer objective products.
+  for (int e = 0; e < E; ++e) {
+    int desired =
+        desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
+                      merge_numerator, merge_denominator);
+    if (desired >= w.count[e])
+      continue;
+    int slots[MAX_R], n = w.count[e];
+    int64_t prior_load[MAX_R];
+    std::copy(w.load, w.load + R, prior_load);
+    for (int i = 0; i < n; ++i) {
+      slots[i] = owner_at(w, e, i);
+      w.load[slots[i] / S] -= workload.cost(e, n, i);
+    }
+    // Retain the least-loaded existing owners after removing this expert's
+    // contribution.
+    std::stable_sort(slots, slots + n, [&](int a, int b) {
+      return w.load[a / S] != w.load[b / S] ? w.load[a / S] < w.load[b / S]
+                                            : a < b;
+    });
+    for (int i = 0; i < desired; ++i)
+      w.load[slots[i] / S] += workload.cost(e, desired, i);
+    if (workload.tile_cost &&
+        (max_load(w.load, R) > max_load(prior_load, R) ||
+         squared_load(w.load, R) > squared_load(prior_load, R))) {
+      std::copy(prior_load, prior_load + R, w.load);
+      continue;
+    }
+    for (int i = 0; i < n; ++i) {
+      w.selected[slots[i]] = false;
+      --w.occupancy[slots[i] / S];
+    }
+    w.head[e] = -1;
+    w.count[e] = 0;
+    for (int i = 0; i < desired; ++i) {
+      append_owner(w, e, slots[i]);
+      w.selected[slots[i]] = true;
+      ++w.occupancy[slots[i] / S];
+    }
+    w.changed[e] = true;
+  }
+  bool considered[MAX_E] = {};
+  for (int it = 0; it < E; ++it) {
+    int e = -1;
+    for (int j = 0; j < E; ++j)
+      if (!considered[j] &&
+          w.count[j] < desired_count(tokens[j], total, R, w.count[j], numerator,
+                                     denominator, merge_numerator,
+                                     merge_denominator) &&
+          (e < 0 || tokens[j] > tokens[e]))
+        e = j;
+    if (e < 0)
+      break;
+    considered[e] = true;
+    int desired =
+        desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
+                      merge_numerator, merge_denominator);
+    while (w.count[e] < desired) {
+      int n = w.count[e], best = -1, best_cost = 2;
+      int64_t weight = workload.cost(e, n + 1, n), released = 0;
+      int64_t after_release[MAX_R];
+      std::copy(w.load, w.load + R, after_release);
+      int64_t total_work = 0;
+      for (int r = 0; r < R; ++r)
+        total_work += w.load[r];
+      const int64_t divisor = int64_t(gain_divisor) * R * R;
+      const int64_t minimum_gain =
+          (total_work * total_work + divisor - 1) / divisor;
+      const int64_t prior_maximum = max_load(w.load, R);
       for (int i = 0; i < n; ++i) {
-        slots[i] = owner_at(w, e, i);
-        w.load[slots[i] / S] -= part(tokens[e], n, i);
-        w.selected[slots[i]] = false;
-        --w.occupancy[slots[i] / S];
+        int r = owner_at(w, e, i) / S;
+        int64_t d = workload.cost(e, n, i) - workload.cost(e, n + 1, i);
+        released += 2 * w.load[r] * d - d * d;
+        after_release[r] -= d;
       }
-      // Keep the least loaded existing owners; retired storage stays pinned
-      // until the previous generation's decode and prefill reads finish.
-      for (int i = 1; i < n; ++i) {
-        int s = slots[i], j = i;
-        while (j > 0 && (w.load[slots[j - 1] / S] > w.load[s / S] ||
-                         (w.load[slots[j - 1] / S] == w.load[s / S] &&
-                          slots[j - 1] > s))) {
-          slots[j] = slots[j - 1];
-          --j;
+      const int64_t unaffected = max_load(after_release, R);
+      int64_t best_gain = LLONG_MIN, best_maximum = LLONG_MAX;
+      for (int r = 0; r < R; ++r) {
+        if (w.occupancy[r] >= S - 1)
+          continue;
+        int cost = 0, dst = find_destination(w, e, r, S, copies, budget, cost);
+        if (dst < 0)
+          continue;
+        int64_t gain = released - 2 * w.load[r] * weight - weight * weight;
+        int64_t maximum = max(unaffected, w.load[r] + weight);
+        if (gain <= 0 || gain < minimum_gain * cost || maximum > prior_maximum)
+          continue;
+        if (best < 0 || maximum < best_maximum ||
+            (maximum == best_maximum &&
+             (gain > best_gain || (gain == best_gain && cost < best_cost)))) {
+          best = dst;
+          best_gain = gain;
+          best_cost = cost;
+          best_maximum = maximum;
         }
-        slots[j] = s;
       }
-      w.head[e] = -1;
-      w.count[e] = 0;
-      for (int i = 0; i < desired; ++i) {
-        append_owner(w, e, slots[i]);
-        w.selected[slots[i]] = true;
-        ++w.occupancy[slots[i] / S];
-        w.load[slots[i] / S] += part(tokens[e], desired, i);
-      }
-      w.changed[e] = true;
-    }
-    bool considered[MAX_E] = {};
-    for (int it = 0; it < E; ++it) {
-      int e = -1;
-      for (int j = 0; j < E; ++j)
-        if (!considered[j] &&
-            w.count[j] < desired_count(tokens[j], total, R, w.count[j],
-                                       numerator, denominator, merge_numerator,
-                                       merge_denominator) &&
-            (e < 0 || tokens[j] > tokens[e]))
-          e = j;
-      if (e < 0)
+      if (best < 0)
         break;
-      considered[e] = true;
-      int desired =
-          desired_count(tokens[e], total, R, w.count[e], numerator, denominator,
-                        merge_numerator, merge_denominator);
-      while (w.count[e] < desired) {
-        int n = w.count[e], best = -1, best_cost = 2;
-        int64_t weight = part(tokens[e], n + 1, n), released = 0;
-        for (int i = 0; i < n; ++i) {
-          int r = owner_at(w, e, i) / S;
-          int64_t d = part(tokens[e], n, i) - part(tokens[e], n + 1, i);
-          released += 2 * w.load[r] * d - d * d;
-        }
-        int64_t best_gain = LLONG_MIN;
-        for (int r = 0; r < R; ++r) {
-          if (w.occupancy[r] >= S - 1)
-            continue;
-          int cost = 0,
-              dst = find_destination(w, e, r, S, copies, budget, cost);
-          if (dst < 0)
-            continue;
-          int64_t gain = released - 2 * w.load[r] * weight - weight * weight;
-          if (best < 0 || gain > best_gain ||
-              (gain == best_gain && cost < best_cost)) {
-            best = dst;
-            best_gain = gain;
-            best_cost = cost;
-          }
-        }
-        if (best < 0)
-          break;
-        install(w, old_owners, e, best, S, R, rpn, best_cost, copies);
-        for (int i = 0; i < n; ++i)
-          w.load[owner_at(w, e, i) / S] -=
-              part(tokens[e], n, i) - part(tokens[e], n + 1, i);
-        append_owner(w, e, best);
-        w.selected[best] = true;
-        ++w.occupancy[best / S];
-        w.load[best / S] += weight;
-        w.changed[e] = true;
-      }
+      install(w, old_owners, e, best, S, R, rpn, best_cost, copies);
+      for (int i = 0; i < n; ++i)
+        w.load[owner_at(w, e, i) / S] -=
+            workload.cost(e, n, i) - workload.cost(e, n + 1, i);
+      append_owner(w, e, best);
+      w.selected[best] = true;
+      ++w.occupancy[best / S];
+      w.load[best / S] += weight;
+      w.changed[e] = true;
     }
   }
 
-  // Write the wide owner table cooperatively; planning decisions stay serial.
+  // Publish the resident layout and active owners together.
   for (int s = 0; s < P; s++) {
     output[s] = w.resident[s];
     sources_out[s] = w.copy_source[s];
@@ -314,7 +364,7 @@ void repair_exchange(const int64_t *tokens, const int *old,
                      const int *old_owners, int *output, int *owners_out,
                      int *sources_out, int E, int R, int S, int budget,
                      int move_budget, int rpn, int gain_divisor,
-                     int layer_offset) {
+                     int layer_offset, const Workload &workload) {
   const int l = layer_offset, P = R * S;
   tokens += l * E;
   old += l * P;
@@ -354,7 +404,6 @@ void repair_exchange(const int64_t *tokens, const int *old,
       w.resident_rank_mask[w.resident[s]] |= uint64_t(1) << (s / S);
   }
   for (int e = 0; e < E; ++e) {
-    total += tokens[e];
     w.head[e] = -1;
     w.count[e] = 0;
     w.changed[e] = false;
@@ -374,19 +423,20 @@ void repair_exchange(const int64_t *tokens, const int *old,
       ++w.occupancy[s / S];
     }
     int n = w.count[e];
-    int64_t bound = (tokens[e] + n - 1) / n;
+    int64_t bound = workload.cost(e, n, 0);
     if (bound > lower)
       lower = bound;
     for (int i = 0; i < n; ++i) {
       int s = owner_at(w, e, i);
-      slot_weight[s] = part(tokens[e], n, i);
+      slot_weight[s] = workload.cost(e, n, i);
+      total += slot_weight[s];
       w.load[s / S] += slot_weight[s];
     }
   }
   int64_t average = (total + R - 1) / R;
   if (average > lower)
     lower = average;
-  // Skip negligible improvements that would consume the bounded copy budget.
+  // Charge repair moves per actual weight copy; resident reuse is free.
   int64_t denominator = int64_t(gain_divisor) * R * R;
   minimum_gain = (total * total + denominator - 1) / denominator;
 
@@ -416,9 +466,18 @@ void repair_exchange(const int64_t *tokens, const int *old,
         int s = src * S + job / R, dst = job % R;
         if (w.load[src] <= w.load[dst])
           continue;
+        int p = slot_part[s];
+        if (p < 0 || w.changed[p / MAX_R])
+          continue;
+        int e = p / MAX_R, i = p % MAX_R;
+        int64_t weight = slot_weight[s];
+        if (!weight)
+          continue;
         int64_t old_excess =
             excess(w.load[src], lower) + excess(w.load[dst], lower);
-        if (old_excess < minimum_gain)
+        // Presence masks can be stale, so these are conservative copy costs.
+        int minimum_ce = !(w.resident_rank_mask[e] & (uint64_t(1) << dst));
+        if (old_excess <= 0 || old_excess < minimum_gain * minimum_ce)
           continue;
         int64_t unaffected = 0;
         for (int h = 0; h < 3 && h < R; ++h) {
@@ -429,13 +488,6 @@ void repair_exchange(const int64_t *tokens, const int *old,
           }
         }
         if (best.e >= 0 && unaffected > best.maximum)
-          continue;
-        int p = slot_part[s];
-        if (p < 0 || w.changed[p / MAX_R])
-          continue;
-        int e = p / MAX_R, i = p % MAX_R;
-        int64_t weight = slot_weight[s];
-        if (!weight)
           continue;
         int ce = 0;
         int to = find_destination(w, e, dst, S, copies, budget, ce);
@@ -455,11 +507,13 @@ void repair_exchange(const int64_t *tokens, const int *old,
             continue;
           int64_t variance_gain =
               2 * delta * (w.load[src] - w.load[dst] - delta);
-          if (variance_gain <= 0 || variance_gain < minimum_gain)
+          if (variance_gain <= 0)
             continue;
           int64_t gain = old_excess - excess(w.load[src] - delta, lower) -
                          excess(w.load[dst] + delta, lower);
-          if (gain <= 0 || gain < minimum_gain)
+          int minimum_cf =
+              f >= 0 && !(w.resident_rank_mask[f] & (uint64_t(1) << src));
+          if (gain <= 0 || gain < minimum_gain * (ce + minimum_cf))
             continue;
           int64_t maximum = unaffected;
           if (w.load[src] - delta > maximum)
@@ -473,6 +527,8 @@ void repair_exchange(const int64_t *tokens, const int *old,
           int back =
               f < 0 ? -1 : find_destination(w, f, src, S, copies, budget, cf);
           if ((f >= 0 && back < 0) || copies + ce + cf > budget)
+            continue;
+          if (gain < minimum_gain * (ce + cf))
             continue;
           Exchange candidate = empty_exchange();
           candidate.e = e;
@@ -555,8 +611,9 @@ bool plan_into(torch::Tensor tokens, torch::Tensor resident,
                int64_t ranks, int64_t copy_budget, int64_t move_budget,
                int64_t ranks_per_node, int64_t split_numerator,
                int64_t split_denominator, int64_t merge_numerator,
-               int64_t merge_denominator, int64_t gain_divisor,
-               int64_t threads) {
+               int64_t merge_denominator, int64_t gain_divisor, int64_t threads,
+               const std::optional<torch::Tensor> &history,
+               const std::optional<torch::Tensor> &cost_profile) {
   for (const auto &t :
        {tokens, resident, owners, output, owners_out, sources_out})
     TORCH_CHECK(t.is_cpu() && t.is_contiguous(),
@@ -598,6 +655,66 @@ bool plan_into(torch::Tensor tokens, torch::Tensor resident,
   at::assert_no_overlap(owners_out, sources_out);
 
   const auto *counts = tokens.data_ptr<int64_t>();
+  const int64_t *profiles = nullptr;
+  if (cost_profile.has_value()) {
+    const auto &p = *cost_profile;
+    TORCH_CHECK(p.is_cpu() && p.is_contiguous() &&
+                    p.scalar_type() == torch::kInt64 && p.dim() == 2 &&
+                    p.size(0) == L && p.size(1) == 3,
+                "Invalid kernel cost profile");
+    for (const auto &out : {output, owners_out, sources_out})
+      at::assert_no_overlap(out, p);
+    profiles = p.data_ptr<int64_t>();
+    for (int l = 0; l < L; ++l)
+      TORCH_CHECK(profiles[l * 3] > 0 && profiles[l * 3] <= 65536 &&
+                      profiles[l * 3 + 1] >= 0 &&
+                      profiles[l * 3 + 1] <= 1000000 &&
+                      profiles[l * 3 + 2] > 0 && profiles[l * 3 + 2] <= INT_MAX,
+                  "Kernel cost profile outside supported range");
+  }
+  const auto validate_work = [&](int l, int64_t total) {
+    TORCH_CHECK(total <= MAX_TOKENS,
+                "Total token count exceeds supported range");
+    if (profiles) {
+      const auto rows = profiles[l * 3], cost = profiles[l * 3 + 1];
+      // Each physical owner can introduce one partially filled M block.
+      const int64_t bound = total + cost * ((total + rows - 1) / rows + P) + P;
+      TORCH_CHECK(bound <= (1LL << 30),
+                  "Kernel cost exceeds integer objective range");
+    }
+  };
+  const int64_t *history_counts = nullptr;
+  int history_size = 0;
+  std::vector<int64_t> mean_counts;
+  if (history.has_value()) {
+    const auto &h = *history;
+    TORCH_CHECK(h.is_cpu() && h.is_contiguous() &&
+                    h.scalar_type() == torch::kInt64 && h.dim() == 3 &&
+                    h.size(0) > 0 && h.size(0) <= INT_MAX && h.size(1) == L &&
+                    h.size(2) == E,
+                "Invalid logical load history");
+    for (const auto &out : {output, owners_out, sources_out})
+      at::assert_no_overlap(out, h);
+    history_counts = h.data_ptr<int64_t>();
+    history_size = h.size(0);
+    mean_counts.assign(L * E, 0);
+    for (int sample = 0; sample < history_size; ++sample) {
+      for (int l = 0; l < L; ++l) {
+        int64_t total = 0;
+        for (int e = 0; e < E; ++e) {
+          const int64_t n = history_counts[(sample * L + l) * E + e];
+          TORCH_CHECK(n >= 0 && n <= MAX_TOKENS,
+                      "Invalid historical token count");
+          total += n;
+          mean_counts[l * E + e] += n;
+        }
+        validate_work(l, total);
+      }
+    }
+    for (auto &n : mean_counts)
+      n /= history_size;
+    counts = mean_counts.data();
+  }
   const auto *physical = resident.data_ptr<int>();
   const auto *active = owners.data_ptr<int>();
   const int S = P / ranks;
@@ -636,22 +753,30 @@ bool plan_into(torch::Tensor tokens, torch::Tensor resident,
       }
       TORCH_CHECK(used_ranks != 0, "Every expert needs an active owner");
     }
-    TORCH_CHECK(total <= MAX_TOKENS,
-                "Total token count exceeds supported range");
+    validate_work(l, total);
     for (int r = 0; r < ranks; ++r)
       TORCH_CHECK(occupancy[r] < S, "Each rank needs an inactive staging slot");
   }
   const int workers = std::min(threads, L);
 #pragma omp parallel for num_threads(workers) schedule(static)
   for (int l = 0; l < L; ++l) {
+    const Workload workload{counts + l * E,
+                            history_counts ? history_counts + l * E : nullptr,
+                            history_size,
+                            L * E,
+                            profiles ? profiles[l * 3] : 1,
+                            profiles ? profiles[l * 3 + 1] : 0};
+    const int layer_gain =
+        workload.tile_cost ? profiles[l * 3 + 2] : gain_divisor;
     plan_split_merge(counts, physical, active, output.data_ptr<int>(),
                      owners_out.data_ptr<int>(), sources_out.data_ptr<int>(), E,
                      ranks, S, copy_budget, ranks_per_node, split_numerator,
-                     split_denominator, merge_numerator, merge_denominator, l);
+                     split_denominator, merge_numerator, merge_denominator,
+                     layer_gain, l, workload);
     repair_exchange(counts, physical, active, output.data_ptr<int>(),
                     owners_out.data_ptr<int>(), sources_out.data_ptr<int>(), E,
                     ranks, S, copy_budget, move_budget, ranks_per_node,
-                    gain_divisor, l);
+                    layer_gain, l, workload);
   }
   // A resident copy can require work even without a routing-table change.
   const auto *copies = sources_out.data_ptr<int>();
@@ -741,5 +866,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Validate and prepare CPU expert pulls",
         pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("plan_into", &plan_into, "Plan placement into reusable CPU buffers",
+        pybind11::arg("tokens"), pybind11::arg("resident"),
+        pybind11::arg("owners"), pybind11::arg("output"),
+        pybind11::arg("owners_out"), pybind11::arg("sources_out"),
+        pybind11::arg("ranks"), pybind11::arg("copy_budget"),
+        pybind11::arg("move_budget"), pybind11::arg("ranks_per_node"),
+        pybind11::arg("split_numerator"), pybind11::arg("split_denominator"),
+        pybind11::arg("merge_numerator"), pybind11::arg("merge_denominator"),
+        pybind11::arg("gain_divisor"), pybind11::arg("threads"),
+        pybind11::arg("history") = pybind11::none(),
+        pybind11::arg("cost_profile") = pybind11::none(),
         pybind11::call_guard<pybind11::gil_scoped_release>());
 }

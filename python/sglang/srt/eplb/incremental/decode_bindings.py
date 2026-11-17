@@ -4,11 +4,12 @@ Captured graphs retain separate routing pointers. Bindings require one Python
 forward thread per worker; GPU streams may execute concurrently.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
+
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.runtime_context import get_resources
 
@@ -20,6 +21,7 @@ class IncrementalEPLBDecodeBindings:
     balance_debug: object = None
     owners: Optional[torch.Tensor] = None
     source_rank: int = 0
+    workloads: object = None
 
     @classmethod
     def from_planner(cls, home_metadata, planner):
@@ -31,13 +33,37 @@ class IncrementalEPLBDecodeBindings:
             raise RuntimeError("Prefill expert routing metadata is missing")
         if live_map.data_ptr() == home_map.data_ptr():
             raise RuntimeError("Decode and prefill routing must not share storage")
+        from sglang.srt.runtime_context import get_exec
+
+        from .workload import GraphWorkloads, validate_ep_profiles
+
         return cls(
+            workloads=GraphWorkloads(
+                planner.L,
+                validator=validate_ep_profiles
+                if get_exec().moe.moe_a2a_backend == "megamoe"
+                else None,
+            ),
             metadata=replace(
                 home_metadata, logical_to_rank_dispatch_physical_map=live_map
             ),
             counts=planner.phys,
             owners=planner.owners,
             source_rank=planner.ep_rank,
+        )
+
+    def capture_workload(self, graph_key):
+        return (
+            self.workloads.capture(graph_key)
+            if self.workloads is not None
+            else nullcontext()
+        )
+
+    def workload_for(self, graph_key, global_num_tokens=None):
+        return (
+            self.workloads.for_batch(graph_key, global_num_tokens)
+            if self.workloads is not None
+            else None
         )
 
     @contextmanager
@@ -98,3 +124,16 @@ def route_decode_topk(topk_ids, layer_id, num_token_non_padded):
         num_token_non_padded,
         bindings.source_rank,
     )
+
+
+def recording_workload():
+    return (
+        _CURRENT is not None
+        and _CURRENT.workloads is not None
+        and _CURRENT.workloads.recording
+    )
+
+
+def record_workload(layer_id, profile):
+    if recording_workload():
+        _CURRENT.workloads.record(layer_id, profile)

@@ -221,7 +221,9 @@ class ExpertPuller:
                     )
         return CopyBatch(src_out, dst_out, nb_out, source_ranks, experts, n_bytes)
 
-    def begin_step(self, *, batch_size=None, original_batch_size=None) -> None:
+    def begin_step(
+        self, *, batch_size=None, original_batch_size=None, cost_profile=None
+    ) -> None:
         """Snapshot loads and adopt the previous plan before decode."""
         if self._closed:
             raise RuntimeError("IncrementalEPLB puller is closed")
@@ -234,6 +236,8 @@ class ExpertPuller:
         wait_start = time.perf_counter() if self._debug else None
         submissions_late = self.stats["submission_late"]
         self._finish_pending()
+        # The previous worker has finished reading the preceding graph's profile.
+        self.planner.cost_profile = cost_profile
         self._debug_round = None
         if self._debug:
             self._debug_round = self._debug.new_round(self._nstep)

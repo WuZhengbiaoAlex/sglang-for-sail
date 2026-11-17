@@ -8,6 +8,7 @@ from typing import Optional, Union
 from unittest.mock import Mock
 
 import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -220,3 +221,51 @@ def test_target_graph_scope_does_not_leak_to_draft(target, raises):
     else:
         assert execute(runner, object()) == "result"
     assert active == []
+
+
+@pytest.mark.parametrize("window", [-1, 0, True, 1.5, 2**31])
+def test_incremental_rejects_invalid_history_window(window):
+    validate = load_function("eplb/incremental/config.py", "validate_options", {})
+    with pytest.raises(ValueError, match="finite positive"):
+        validate(options(expert_distribution_recorder_buffer_size=window))
+
+
+@pytest.mark.parametrize(
+    "enabled,algorithm,window,interval,mode,expected",
+    [
+        (True, "incremental", None, 1000, None, 1),
+        (True, "incremental", 8, 1000, None, 8),
+        (True, "auto", None, 1000, "stat", 1000),
+        (False, "auto", None, 1000, None, 1000),
+        (False, "auto", None, None, None, None),
+        (True, "auto", -1, 1000, "stat", -1),
+    ],
+)
+def test_history_resolution_preserves_other_eplb_defaults(
+    enabled, algorithm, window, interval, mode, expected
+):
+    cfg = options(
+        enable_eplb=enabled,
+        eplb_algorithm=algorithm,
+        expert_distribution_recorder_buffer_size=window,
+        eplb_rebalance_num_iterations=interval,
+        expert_distribution_recorder_mode=mode,
+    )
+
+    def resolve(server_args, source, **fields):
+        for key, value in fields.items():
+            setattr(server_args, key, value)
+
+    fn = load_function(
+        "arg_groups/parallel_hook.py",
+        "handle_expert_distribution_metrics",
+        dict(
+            Any=object,
+            resolving_view=lambda x: x,
+            declare_resolution=resolve,
+            should_report_expert_balancedness=lambda x: False,
+        ),
+    )
+    fn(cfg)
+    assert cfg.expert_distribution_recorder_buffer_size == expected
+    assert cfg.eplb_rebalance_num_iterations == interval

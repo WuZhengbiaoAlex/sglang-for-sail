@@ -7,6 +7,40 @@ from sglang.srt.layers.moe.utils import get_expert_recv_stats_kwargs
 from sglang.srt.runtime_context import get_buffer, get_forward, get_parallel
 
 
+def _record_kernel_workload(experts, deep_gemm, buf, num_tokens, gemm_kwargs):
+    if not gemm_kwargs:
+        return
+    from sglang.srt.eplb.incremental.decode_bindings import (
+        record_workload,
+        recording_workload,
+    )
+
+    if not recording_workload():
+        return
+    query = getattr(deep_gemm, "get_mega_moe_kernel_config", None)
+    if query is None:
+        return
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.eplb.incremental.config import PPU_MEGAMOE_COST_PROFILES
+
+    config = query(buf, num_tokens)
+    logical = get_global_expert_location_metadata().num_logical_experts
+    rows = config["l1_block_m"]
+    key = (
+        buf.group.size(),
+        logical,
+        buf.num_topk,
+        buf.hidden,
+        buf.intermediate_hidden,
+        num_tokens,
+        rows,
+    )
+    calibration = PPU_MEGAMOE_COST_PROFILES.get(key)
+    if calibration is not None:
+        cost, gain_divisor = calibration
+        record_workload(experts.layer_id, (rows, cost, gain_divisor))
+
+
 def prepare_weights(experts, *, activation):
     """Transform raw checkpoint UE8M0 pairs once, before ordinary preprocessing."""
     import deep_gemm
@@ -121,6 +155,7 @@ def forward(
     )
     if weight_event is not None:
         weight_event.current_stream_wait()
+    _record_kernel_workload(experts, deep_gemm, buf, num_tokens, gemm_kwargs)
     deep_gemm.fp4_fp4_mega_moe(
         y,
         experts.mega_l1_weights,
