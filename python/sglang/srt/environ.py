@@ -2006,6 +2006,12 @@ class Envs:
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
     SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
+    # Optional BF16 score output with FP8 Q/K; requires compatible DeepGEMM.
+    SGLANG_PPU_K31_BF16_PAGED_LOGITS = EnvBool(False)
+    # Measured M890P partial/merge FP32 TopK shapes; other calls stay native.
+    SGLANG_PPU_DSA_SPLIT_TOPK = EnvBool(True)
+    # Opt-in register/partial-merge BF16 TopK for measured M890P shapes.
+    SGLANG_PPU_DSA_SPLIT_TOPK_BF16 = EnvBool(False)
     # Kimi K3.1 eager prefill: distribute replicated indexer query rows over
     # attention TP, then gather only the final physical-slot TopK indices.
     SGLANG_PPU_DSA_INDEXER_TP_SPLIT = EnvBool(True)
