@@ -406,6 +406,8 @@ def test_ppu_megamoe_cached_views_do_not_retain_transform_bases(monkeypatch):
     import sys
     import weakref
 
+    from sglang.srt.environ import envs
+
     bases = []
 
     def transform(l1, l2, *, activation):
@@ -423,7 +425,7 @@ def test_ppu_megamoe_cached_views_do_not_retain_transform_bases(monkeypatch):
         "deep_gemm",
         SimpleNamespace(transform_weights_for_mega_moe=transform),
     )
-    fn = definition("layers/moe/ppu_mega_moe.py", "prepare_weights", {})
+    fn = definition("layers/moe/ppu_mega_moe.py", "prepare_weights", dict(envs=envs))
     experts = torch.nn.Module()
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
     for value, name in enumerate(names):
@@ -433,7 +435,8 @@ def test_ppu_megamoe_cached_views_do_not_retain_transform_bases(monkeypatch):
                 torch.full((2, 4, 8), value, dtype=torch.uint8), requires_grad=False
             ),
         )
-    fn(experts, activation="silu")
+    with envs.SGLANG_OPT_ULTRA_EP_PPU.override(False):
+        fn(experts, activation="silu")
     for name, view in zip(names, experts.mega_l1_weights + experts.mega_l2_weights):
         owner = getattr(experts, name)
         assert view._base is None
