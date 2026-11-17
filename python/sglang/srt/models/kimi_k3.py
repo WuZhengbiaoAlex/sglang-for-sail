@@ -37,7 +37,11 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_sp_collective,
+    k31_ppu_gemm_rs,
+)
 from sglang.srt.layers.cp.interleave import cp_sequence_to_interleave_order
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
@@ -3008,9 +3012,19 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         # ---- Attention ----
-        hidden_states = self._run_self_attn(
-            hidden_states, positions, forward_batch, zero_allocator
-        )
+        fused_shard_lo = -1
+        fused_o_proj = getattr(self, "_ppu_o_proj_rs", None)
+        if fused_o_proj is None:
+            hidden_states = self._run_self_attn(
+                hidden_states, positions, forward_batch, zero_allocator
+            )
+        else:
+            with fused_o_proj.scope(forward_batch, hidden_states.shape[0]) as call:
+                hidden_states = self._run_self_attn(
+                    hidden_states, positions, forward_batch, zero_allocator
+                )
+                if call is not None:
+                    fused_shard_lo = call.shard_lo
 
         # ---- Complete o_proj's deferred reduction ----
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
@@ -3019,7 +3033,14 @@ class KimiK3DecoderLayer(nn.Module):
         rows = None
         shard_lo = -1
         agg2_fused = False
-        if self._sp_moe:
+        if fused_shard_lo >= 0:
+            # GEMM already produced this rank's reduced shard. In particular,
+            # do not send the shortened tensor through a second RS/all-reduce.
+            shard_lo = fused_shard_lo
+            rows = slice(shard_lo, shard_lo + hidden_states.shape[0])
+            if prefix_sum is not None and prefix_sum.shape[0] != hidden_states.shape[0]:
+                prefix_sum = prefix_sum[rows]
+        elif self._sp_moe:
             group = get_parallel().attn_tp_group
             if (
                 hidden_states.shape[0] > 0
@@ -3143,6 +3164,8 @@ class KimiK3LinearModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+
+        k31_ppu_gemm_rs.initialize_model(self)
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

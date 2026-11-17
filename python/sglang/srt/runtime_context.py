@@ -681,6 +681,9 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # Model-owned K3.1 PPU o_proj sharded-output capability, scoped to
+        # one main-model VERIFY attention call (never a draft/prefill call).
+        "k31_o_proj_rs_call": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -698,6 +701,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "k31_o_proj_rs_call",
         }
     )
 

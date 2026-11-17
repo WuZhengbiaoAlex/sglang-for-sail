@@ -154,6 +154,13 @@ class PPUDenseW8A8FP8LinearMethod(UnquantizedLinearMethod):
 
         if not prequantized:
             x_q, x_scale = sglang_per_token_quant_fp8(x_2d)
+        # Only a model-owned VERIFY scope may change the output row layout.
+        # This stays below o_proj.forward, so MLA's output gate still executes.
+        fused_rs = getattr(layer, "_ppu_o_proj_rs", None)
+        if fused_rs is not None and bias is None and len(input_shape) == 2:
+            shard = fused_rs.try_apply(layer, x_q, x_scale, weight, weight_scale)
+            if shard is not None:
+                return shard
         out = torch.empty(
             (x_2d.shape[0], weight.shape[0]),
             dtype=torch.bfloat16,
