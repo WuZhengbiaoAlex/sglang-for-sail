@@ -356,11 +356,12 @@ class TestIndexerRequestSharding(CustomTestCase):
             force_unfused_topk=False,
         )
         indexer = object.__new__(Indexer)
+        torch.nn.Module.__init__(indexer)
         indexer.use_fp4 = indexer.bf16_indexer = indexer.use_int8 = False
         indexer.use_fp8 = True
         indexer.index_topk = 3
         indexer.paged_mqa_logits_backend = SimpleNamespace(is_cutedsl=lambda: False)
-        indexer._get_index_k_read_buffer = lambda *_: torch.zeros((64, 132))
+        indexer._get_index_k_read_buffer = lambda *_: torch.zeros((1, 64 * 132))
         indexer._get_paged_mqa_logits_dispatch = lambda *a, **kw: torch.zeros(
             (20, 128), dtype=torch.float32
         )
