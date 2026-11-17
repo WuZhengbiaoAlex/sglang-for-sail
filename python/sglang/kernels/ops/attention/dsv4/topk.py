@@ -116,7 +116,7 @@ def _use_ppu_split_topk(scores, output, page_size, out_raw_indices):
             or (1 <= scores.shape[0] <= 25 and scores.shape[1] >= 65536)
             or (26 <= scores.shape[0] <= 32 and scores.shape[1] >= 98304)
         )
-        and 32768 <= scores.shape[1] <= 131968
+        and scores.shape[1] >= 32768
         and scores.stride(1) == 1
         and scores.stride(0) % 4 == 0
         and scores.data_ptr() % 16 == 0
