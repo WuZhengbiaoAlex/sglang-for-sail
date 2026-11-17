@@ -439,18 +439,22 @@ def _topk_transform_v2_logical(
     query and produces only ``-1``. These value invariants belong to the metadata
     producer: checking device values here would synchronize graph execution.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        topk_transform_paged_v2,
+        topk_transform_paged_v2_bf16,
+    )
 
     assert logits.dim() == 2, "v2 logical top-k expects 2D scores"
     num_rows = logits.shape[0]
+    use_bf16 = logits.dtype == torch.bfloat16 and is_ppu()
     # DeepGEMM may return a padded score view: its row stride may exceed width.
     # Require the native ABI rather than copying the wide logits to contiguous.
     assert (
-        logits.dtype == torch.float32
+        (logits.dtype == torch.float32 or use_bf16)
         and logits.stride(1) == 1
-        and logits.stride(0) % 4 == 0
+        and logits.stride(0) % (8 if use_bf16 else 4) == 0
     ), (
-        f"v2 logical top-k expects fp32 scores with unit column stride and "
+        f"v2 logical top-k expects fp32 (or PPU bf16) scores with unit column stride and "
         f"16B-aligned row stride, got {logits.dtype=} {logits.stride()=}"
     )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
@@ -475,6 +479,12 @@ def _topk_transform_v2_logical(
 
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     if num_rows == 0:
+        return out
+    if use_bf16:
+        # Keep logical token positions until after attention-TP all-gather.
+        # The BF16 kernel consumes live lengths directly; the per-shard plan
+        # remains validated above and refreshed by the metadata producer.
+        topk_transform_paged_v2_bf16(logits, lengths, None, out, page_size)
         return out
     topk_transform_paged_v2(
         logits, lengths, None, out, page_size, plan, out_raw_indices=None

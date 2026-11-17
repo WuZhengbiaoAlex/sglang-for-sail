@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -85,6 +85,7 @@ from sglang.srt.utils import (
     is_npu,
     is_ppu,
     is_xpu,
+    print_info_once,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -1541,6 +1542,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights,
                 block_tables,
                 request_shard,
+                paged_mqa_logits=paged_mqa_logits,
                 max_seq_len=max_seq_len,
                 page_size=page_size,
             )
@@ -1719,6 +1721,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         block_tables: torch.Tensor,
         shard: IndexerRequestShardMetadata,
         *,
+        paged_mqa_logits: Callable[..., torch.Tensor],
         max_seq_len: int,
         page_size: int = 64,
     ) -> torch.Tensor:
@@ -1739,7 +1742,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         start, end = shard.query_start, shard.query_end
         local_lengths = shard.ctx_lens_2d.reshape(-1)
         logits = deepgemm_paged_mqa_logits_native(
-            self._get_paged_mqa_logits_dispatch,
+            paged_mqa_logits,
             q_fp8[start:end],
             kv_cache_fp8,
             weights[start:end],
@@ -1755,6 +1758,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         local_topk = _topk_transform_v2_logical(
             logits, local_lengths, self.index_topk, shard.topk_v2_plan, page_size
         )
+        if logits.dtype == torch.bfloat16 and get_is_capture_mode():
+            print_info_once(
+                "PPU K31 BF16 paged logits and logical TopK runtime hit "
+                f"rows={logits.shape[0]} width={logits.shape[1]} "
+                f"dtype={logits.dtype} attn_tp_rank={group.rank_in_group}"
+            )
 
         # Each invocation owns its output. During graph capture these allocations
         # are recorded in the graph pool, avoiding a mutable cross-layer scratch

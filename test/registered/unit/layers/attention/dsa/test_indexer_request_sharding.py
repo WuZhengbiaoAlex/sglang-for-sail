@@ -270,6 +270,7 @@ class TestIndexerRequestSharding(CustomTestCase):
         indexer.index_topk = topk
         indexer.num_init_tokens = indexer.num_local_tokens = 0
         indexer._get_paged_mqa_logits_dispatch = object()
+        selected_dispatch = object()
 
         def logits_fn(
             dispatch,
@@ -285,6 +286,7 @@ class TestIndexerRequestSharding(CustomTestCase):
             B,
             next_n,
         ):
+            self.assertIs(dispatch, selected_dispatch)
             torch.testing.assert_close(local_q, q[shard.query_start : shard.query_end])
             torch.testing.assert_close(
                 local_pages, pages[shard.query_start : shard.query_end]
@@ -315,7 +317,13 @@ class TestIndexerRequestSharding(CustomTestCase):
             ),
         ):
             out = indexer._get_topk_paged_tp_sharded(
-                q, torch.empty(0), weights, pages, shard, max_seq_len=width
+                q,
+                torch.empty(0),
+                weights,
+                pages,
+                shard,
+                paged_mqa_logits=selected_dispatch,
+                max_seq_len=width,
             )
         expected = torch.stack(
             (
@@ -328,6 +336,87 @@ class TestIndexerRequestSharding(CustomTestCase):
         torch.testing.assert_close(out[: batch * 5], expected)
         self.assertEqual(tuple(out.shape), (batch * 5 + 4, topk))
         self.assertTrue(bool((out[batch * 5 :] == -1).all()))
+
+    def test_verify_shard_retains_selected_bf16_logits_callable(self):
+        """The outer dispatcher must not drop its dtype choice at the TP branch."""
+        batch, next_n = 32, 5
+        rows = batch * next_n
+        ctx = torch.full((batch, next_n), 128, dtype=torch.int32)
+        shard = self.shard(batch, 0, ctx)
+        pages = torch.zeros((rows, 2), dtype=torch.int32)
+        metadata = SimpleNamespace(
+            get_page_table_64=lambda: pages,
+            get_seqlens_expanded=lambda: ctx.flatten(),
+            get_seqlens_int32=lambda: ctx[:, 0],
+            get_dsa_extend_len_cpu=lambda: [1] * rows,
+            uses_paged_topk_v2=lambda n, k: n == rows and k == 3,
+            paged_mqa_schedule_metadata=torch.empty((8, 2), dtype=torch.int32),
+            paged_mqa_ctx_lens_2d=ctx,
+            indexer_request_shard=shard,
+            force_unfused_topk=False,
+        )
+        indexer = object.__new__(Indexer)
+        indexer.use_fp4 = indexer.bf16_indexer = indexer.use_int8 = False
+        indexer.use_fp8 = True
+        indexer.index_topk = 3
+        indexer.paged_mqa_logits_backend = SimpleNamespace(is_cutedsl=lambda: False)
+        indexer._get_index_k_read_buffer = lambda *_: torch.zeros((64, 132))
+        indexer._get_paged_mqa_logits_dispatch = lambda *a, **kw: torch.zeros(
+            (20, 128), dtype=torch.float32
+        )
+
+        def native(*args, logits_dtype=torch.float32, **kwargs):
+            return torch.zeros((20, 128), dtype=logits_dtype)
+
+        def sharded(
+            q,
+            kv,
+            weights,
+            actual_pages,
+            actual_shard,
+            *,
+            paged_mqa_logits,
+            max_seq_len,
+            page_size,
+        ):
+            self.assertIs(actual_shard, shard)
+            self.assertIs(actual_pages, pages)
+            scores = paged_mqa_logits(q, kv, weights)
+            # Surface the callable's output dtype in the branch result, rather
+            # than merely checking that a mock received some callable.
+            return torch.full(
+                (rows, 3), int(scores.dtype == torch.bfloat16), dtype=torch.int32
+            )
+
+        module = "sglang.srt.layers.attention.dsa.dsa_indexer"
+        with (
+            patch(module + "._is_cuda", True),
+            patch(module + "._is_hip", False),
+            patch(module + "._is_xpu", False),
+            patch(module + ".is_ppu", return_value=True),
+            patch(
+                module + ".get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(
+                module + ".deep_gemm",
+                SimpleNamespace(fp8_paged_mqa_logits=native),
+                create=True,
+            ),
+            patch.object(indexer, "_get_topk_paged_tp_sharded", side_effect=sharded),
+        ):
+            for enabled in (False, True):
+                indexer.use_bf16_paged_logits = enabled
+                out = indexer._get_topk_paged(
+                    SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                    0,
+                    torch.zeros((rows, 32, 128)),
+                    torch.ones((rows, 32, 1)),
+                    metadata,
+                )
+                torch.testing.assert_close(
+                    out, torch.full((rows, 3), int(enabled), dtype=torch.int32)
+                )
 
     def test_ppu_precomputed_hook_passes_padding_and_restores_metadata_on_error(self):
         from sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks import (
@@ -451,12 +540,74 @@ class TestIndexerRequestSharding(CustomTestCase):
                     scores, lengths, 16, torch.zeros(shape, dtype=torch.int32)
                 )
 
+    def test_bf16_logical_topk_observes_refreshed_lengths_without_rebinding(self):
+        # This checks the graph metadata contract on CPU, not GPU graph capture:
+        # the same length/plan tensors are updated in place between invocations.
+        scores = torch.tensor(
+            [[0, 5, 2, 7, 4, 1, 6, 3], [7, 6, 5, 4, 3, 2, 1, 0]],
+            dtype=torch.bfloat16,
+        )
+        lengths = torch.tensor([4, 0], dtype=torch.int32)
+        plan = torch.zeros((3, 2), dtype=torch.int32)
+        pointers = lengths.data_ptr(), plan.data_ptr()
+
+        def select(logits, lens, pages, out, page_size):
+            self.assertEqual(logits.dtype, torch.bfloat16)
+            self.assertIs(lens, lengths)
+            self.assertIsNone(pages)
+            self.assertEqual(page_size, 64)
+            out.fill_(-1)
+            for row, length in enumerate(lens.tolist()):
+                take = min(length, out.shape[1])
+                if take:
+                    out[row, :take] = (
+                        logits[row, :length].float().topk(take).indices.int()
+                    )
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.dsa_topk_backend.is_ppu",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.topk.topk_transform_paged_v2",
+                side_effect=AssertionError("BF16 must not enter FP32 kernel"),
+            ),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.topk.topk_transform_paged_v2_bf16",
+                side_effect=select,
+            ),
+        ):
+            first = _topk_transform_v2_logical(scores, lengths, 3, plan)
+            lengths.copy_(torch.tensor([0, 2], dtype=torch.int32))
+            plan[1:, 1].copy_(lengths)
+            second = _topk_transform_v2_logical(scores, lengths, 3, plan)
+        self.assertEqual(pointers, (lengths.data_ptr(), plan.data_ptr()))
+        torch.testing.assert_close(
+            first, torch.tensor([[3, 1, 2], [-1, -1, -1]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            second, torch.tensor([[-1, -1, -1], [0, 1, -1]], dtype=torch.int32)
+        )
+
+    def test_bf16_logical_topk_requires_ppu_and_sixteen_byte_row_alignment(self):
+        lengths = torch.tensor([4, 4], dtype=torch.int32)
+        plan = torch.zeros((3, 2), dtype=torch.int32)
+        module = "sglang.srt.layers.attention.dsa.dsa_topk_backend"
+        for ppu, width in ((False, 8), (True, 4)):
+            with self.subTest(ppu=ppu, width=width), patch(
+                module + ".is_ppu", return_value=ppu
+            ), self.assertRaises(AssertionError):
+                _topk_transform_v2_logical(
+                    torch.zeros((2, width), dtype=torch.bfloat16), lengths, 3, plan
+                )
+
     def test_logical_topk_rejects_invalid_abi_without_dispatch(self):
         scores = torch.zeros((2, 8), dtype=torch.float32)
         lengths = torch.tensor([4, 8], dtype=torch.int32)
         plan = torch.zeros((3, 2), dtype=torch.int32)
         cases = [
-            (scores.bfloat16(), lengths, 2, plan, 64),
+            (scores.half(), lengths, 2, plan, 64),
             (scores[:, ::2], lengths, 2, plan, 64),
             (torch.zeros((2, 9)), lengths, 2, plan, 64),
             (scores, lengths.long(), 2, plan, 64),
