@@ -419,7 +419,8 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                     metadata.dsa_seqlens_expanded, expected.flatten()
                 )
                 self.assertEqual(
-                    planner.call_args.kwargs["metadata_extra"], (5, 32, 128, 1)
+                    planner.call_args.kwargs["metadata_extra"],
+                    (5, 32, 128, torch.float8_e4m3fn),
                 )
                 self.assertEqual(metadata.page_table_1.shape[0], bs * 5)
                 self.assertEqual(metadata.real_page_table.shape[0], bs * 5)
@@ -448,17 +449,19 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                 )
                 self.assertEqual(ctx.shape, (width, 1))
                 torch.testing.assert_close(ctx[:, 0], expanded)
-        for bf16, elem in ((False, 1), (True, 2)):
-            with self.subTest(
-                bf16=bf16
-            ), self.cpu_planners(), envs.SGLANG_SAIL_BF16_INDEXER.override(bf16):
+        for bf16, dtype in ((False, torch.int8), (True, torch.bfloat16)):
+            with (
+                self.subTest(bf16=bf16),
+                self.cpu_planners(),
+                envs.SGLANG_SAIL_BF16_INDEXER.override(bf16),
+            ):
                 backend = self.make_backend()
                 backend.ppu_fp8_indexer = False
                 self.assertEqual(
                     backend._paged_mqa_schedule_metadata_extra(
                         torch.ones((5, 1), dtype=torch.int32)
                     ),
-                    (1, 12, 128, elem),
+                    (1, 32, 128, dtype),
                 )
 
     def test_other_forward_modes_and_sm100_keep_existing_layout(self):
@@ -562,7 +565,8 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                         )
                     self.assert_replay(metadata, replay_seq, pointers)
                     self.assertEqual(
-                        planner.call_args.kwargs["metadata_extra"], (5, 32, 128, 1)
+                        planner.call_args.kwargs["metadata_extra"],
+                        (5, 32, 128, torch.float8_e4m3fn),
                     )
                 self.assertEqual(
                     backend._fused_verify_metadata.call_count, 2 if fused else 0
@@ -606,7 +610,8 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                     )
                 self.assert_replay(metadata, replay_seq, pointers)
                 self.assertEqual(
-                    planner.call_args.kwargs["metadata_extra"], (5, 32, 128, 1)
+                    planner.call_args.kwargs["metadata_extra"],
+                    (5, 32, 128, torch.float8_e4m3fn),
                 )
 
     def test_indexer_missing_schedule_uses_grouped_width_and_actual_heads(self):
@@ -670,7 +675,8 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                         metadata,
                     )
                 self.assertEqual(
-                    planner.call_args.kwargs["metadata_extra"], (5, 32, 128, 1)
+                    planner.call_args.kwargs["metadata_extra"],
+                    (5, 32, 128, torch.float8_e4m3fn),
                 )
                 args = native.call_args.args
                 self.assertEqual(args[0].shape, (bs, 5, 32, 128))

@@ -149,7 +149,7 @@ def execute(args, result):
                     values,
                     PAGE,
                     dg.get_num_sms(),
-                    metadata_extra=(NEXT_N, HEADS, DIM, 1),
+                    metadata_extra=(NEXT_N, HEADS, DIM, torch.float8_e4m3fn),
                 )
 
             full_schedule = schedule(torch.full_like(ctx, max_len))

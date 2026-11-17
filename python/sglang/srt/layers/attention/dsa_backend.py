@@ -872,14 +872,19 @@ class DeepseekSparseAttnBackend(
 
     def _paged_mqa_schedule_metadata_extra(
         self, seqlens_32_2d: torch.Tensor
-    ) -> Tuple[int, int, int, int]:
+    ) -> Tuple[int, int, int, torch.dtype]:
+        qk_dtype = (
+            torch.bfloat16
+            if envs.SGLANG_SAIL_BF16_INDEXER.get()
+            else torch.float8_e4m3fn
+            if self.ppu_fp8_indexer
+            else torch.int8
+        )
         return (
             seqlens_32_2d.shape[1],  # next_n must match the native Q layout
-            # Correct the validated PPU FP8 schedule's indexer head count;
-            # leave the other dtype variants' existing metadata ABI unchanged.
-            self.indexer_num_heads if self.ppu_fp8_indexer else self.num_q_heads,
-            self.indexer_head_dim,  # head_dim
-            (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            self.indexer_num_heads,
+            self.indexer_head_dim,  # logical dimension, including packed MXFP4
+            qk_dtype,
         )
 
     def _build_paged_mqa_schedule_metadata(

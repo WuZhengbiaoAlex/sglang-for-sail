@@ -1460,8 +1460,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata_extra = (
                     next_n if use_dg_native else 1,
                     q_probe.shape[1],  # num_heads
-                    q_probe.shape[2],  # head_dim (packed for FP4)
-                    1 if not self.bf16_indexer else 2,  # element size
+                    q_probe.shape[2] * (2 if self.use_fp4 else 1),
+                    torch.int8 if self.use_fp4 else q_probe.dtype,
                 )
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d,

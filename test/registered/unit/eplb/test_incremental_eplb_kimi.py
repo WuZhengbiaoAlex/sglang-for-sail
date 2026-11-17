@@ -198,19 +198,36 @@ def test_megamoe_is_supported_independently_of_deepep_mode():
 
 
 @pytest.mark.parametrize("active", [False, True])
-def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, active):
+@pytest.mark.parametrize("ultra_prefill", [False, True])
+def test_ppu_megamoe_forwards_optional_physical_receive_counts(
+    monkeypatch, active, ultra_prefill
+):
     import sys
 
     stats = torch.zeros(14, dtype=torch.int32) if active else None
-    compute, dispatch = Mock(), Mock()
+    events = []
+    compute, dispatch = (
+        Mock(side_effect=lambda *a, **kw: events.append("compute")),
+        Mock(),
+    )
     workspace = SimpleNamespace(
         x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+    )
+    allocate = Mock(return_value=workspace)
+    weight_event = SimpleNamespace(current_stream_wait=lambda: events.append("wait"))
+    replica = SimpleNamespace(
+        w1=object(), w1_scale=object(), w2=object(), w2_scale=object()
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.ppu_mega_moe_ultra_ep",
+        SimpleNamespace(prepare_prefill=lambda experts, ids: (ids, weight_event)),
     )
     monkeypatch.setitem(
         sys.modules,
         "deep_gemm",
         SimpleNamespace(
-            get_symm_buffer_for_mega_moe=Mock(return_value=workspace),
+            get_symm_buffer_for_mega_moe=allocate,
             mega_moe_pre_dispatch=dispatch,
             fp4_fp4_mega_moe=compute,
         ),
@@ -233,6 +250,7 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
                 )
             ),
             get_buffer=lambda *args: state,
+            get_forward=lambda: SimpleNamespace(is_extend_in_batch=ultra_prefill),
             get_parallel=lambda: SimpleNamespace(
                 moe_ep_group=SimpleNamespace(device_group=object())
             ),
@@ -244,7 +262,13 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
         mega_l1_weights=object(),
         mega_l2_weights=object(),
     )
+    if ultra_prefill:
+        experts._ppu_mega_ultra_ep = SimpleNamespace(
+            num_global_physical_experts=512,
+            replica_weight_pool=lambda: replica,
+        )
     for rows in (3, 0):
+        events.clear()
         output = fn(
             experts,
             torch.zeros(rows, 8),
@@ -255,15 +279,34 @@ def test_ppu_megamoe_forwards_optional_physical_receive_counts(monkeypatch, acti
             top_k=2,
         )
         assert output.shape == (rows, 8)
-        assert (
-            compute.call_args.kwargs.get("cumulative_local_expert_recv_stats") is stats
-        )
-        if not active:
+        if ultra_prefill:
+            assert events == ["wait", "compute"]
+            assert compute.call_args.kwargs["l1_weights_replicas"] == (
+                replica.w1,
+                replica.w1_scale,
+            )
+            assert compute.call_args.kwargs["l2_weights_replicas"] == (
+                replica.w2,
+                replica.w2_scale,
+            )
             assert "cumulative_local_expert_recv_stats" not in compute.call_args.kwargs
+            assert allocate.call_args.kwargs["num_experts"] == 512
+        else:
+            assert events == ["compute"]
+            assert (
+                compute.call_args.kwargs.get("cumulative_local_expert_recv_stats")
+                is stats
+            )
+            if not active:
+                assert (
+                    "cumulative_local_expert_recv_stats" not in compute.call_args.kwargs
+                )
         assert "num_logical_experts" not in compute.call_args.kwargs
         assert compute.call_args.args[1] is experts.mega_l1_weights
         assert compute.call_args.args[3] is workspace
         assert dispatch.call_args.args[1].dtype == torch.int64
+        assert allocate.call_args.kwargs["mma_type"] == "fp4xfp4"
+        assert dispatch.call_args.kwargs["mma_type"] == "fp4xfp4"
         assert dispatch.call_args.args[3:7] == (
             workspace.x,
             workspace.x_sf,
