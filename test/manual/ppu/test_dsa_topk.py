@@ -179,6 +179,7 @@ def check_fp32():
         (81920, 28), (81920, 31), (81920, 32), (98304, 26), (98304, 31),
         (131928, 32), (131928, 33),
         (32768, 5), (65528, 5), (131976, 5),
+        (133248, 20), (133248, 21), (133256, 20),
     ]
     for width, rows in cases:
         # Include a padded score stride, causal boundaries, empty/short rows,
