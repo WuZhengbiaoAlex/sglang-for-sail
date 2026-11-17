@@ -11,7 +11,8 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_ppu, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -64,6 +65,64 @@ def _jit_topk_v2_module():
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
+    )
+
+
+@cache_once
+def _jit_topk_v2_bf16_module():
+    return load_jit(
+        make_name("topk_v2_bf16"),
+        cuda_files=["deepseek_v4/topk_v2_bf16.cuh"],
+        cuda_wrappers=[("transform_paged", "BF16PagedTopKKernel::transform_paged")],
+    )
+
+
+@cache_once
+def _jit_ppu_split_topk_bf16_module():
+    return load_jit(
+        make_name("ppu_split_topk_bf16"),
+        cuda_files=["deepseek_v4/ppu_topk_split_bf16.cuh"],
+        cuda_wrappers=[
+            ("partial", "PPUTopKSplitBF16Optimized::partial"),
+            ("merge", "PPUTopKSplitBF16Optimized::merge"),
+            ("direct", "PPUTopKSplitBF16Optimized::direct"),
+        ],
+    )
+
+
+@cache_once
+def _jit_ppu_split_topk_module():
+    return load_jit(
+        make_name("ppu_split_topk"),
+        cuda_files=["deepseek_v4/ppu_topk_split.cuh"],
+        cuda_wrappers=[
+            ("partial", "PPUTopKSplit::partial"),
+            ("merge", "PPUTopKSplit::merge"),
+        ],
+    )
+
+
+def _use_ppu_split_topk(scores, output, page_size, out_raw_indices):
+    # Preserve B4/N5 and admit other small row counts at measured contexts.
+    # Medium contexts can add partial-grid waves and regress on ordered
+    # scores; their row limit stays lower than the long-context limit.
+    return (
+        is_ppu()
+        and envs.SGLANG_PPU_DSA_SPLIT_TOPK.get()
+        and torch.cuda.get_device_properties(scores.device).multi_processor_count == 39
+        and scores.dtype == torch.float32
+        and (
+            scores.shape[0] == 20
+            or (1 <= scores.shape[0] <= 25 and scores.shape[1] >= 65536)
+            or (26 <= scores.shape[0] <= 32 and scores.shape[1] >= 98304)
+        )
+        and 32768 <= scores.shape[1] <= 131968
+        and scores.stride(1) == 1
+        and scores.stride(0) % 4 == 0
+        and scores.data_ptr() % 16 == 0
+        and output.shape[1] == 2048
+        and page_size == 64
+        and out_raw_indices is None
     )
 
 
@@ -263,6 +322,57 @@ def topk_transform_ragged_v2(
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
+def topk_transform_paged_v2_bf16(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Select exact BF16 top-k on PPU and map indices through the page table.
+
+    ``page_tables=None`` emits logical positions for attention-TP gathering.
+    Score rows must start at 16-byte aligned addresses. Each length must be
+    between zero and the score width, with enough pages to cover that length.
+    The BF16 split switch opts eligible M890P calls into register or split TopK;
+    other calls retain the native selector.
+    """
+    if (
+        page_tables is None
+        and envs.SGLANG_PPU_DSA_SPLIT_TOPK_BF16.get()
+        and is_ppu()
+        and torch.cuda.get_device_properties(scores.device).multi_processor_count == 39
+        and scores.dtype == torch.bfloat16
+        and (
+            (1 <= scores.shape[0] <= 256 and 30720 <= scores.shape[1] <= 32768)
+            or (scores.shape[0] == 20 and 32768 < scores.shape[1] <= 262144)
+            or (1 <= scores.shape[0] < 20 and 98304 <= scores.shape[1] <= 262144)
+        )
+        and scores.stride(1) == 1
+        and scores.stride(0) % 8 == 0
+        and scores.data_ptr() % 16 == 0
+        and out_page_indices.shape[1] == 2048
+        and page_size == 64
+    ):
+        width = scores.shape[1]
+        module = _jit_ppu_split_topk_bf16_module()
+        if width <= 32768:
+            module.direct(scores, seq_lens, out_page_indices)
+            return
+        # Long partials stay within 48K keys and follow live graph lengths.
+        splits = 3 if width <= 147456 else 6
+        shape = (scores.shape[0], splits * 2048)
+        indices = torch.empty(shape, dtype=torch.int32, device=scores.device)
+        values = torch.empty(shape, dtype=torch.bfloat16, device=scores.device)
+        lengths = torch.empty_like(seq_lens)
+        module.partial(scores, seq_lens, indices, values, lengths, splits)
+        module.merge(values, lengths, indices, out_page_indices)
+        return
+    _jit_topk_v2_bf16_module().transform_paged(
+        scores, seq_lens, page_tables, out_page_indices, page_size
+    )
+
+
 def topk_transform_paged_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -312,6 +422,18 @@ def topk_transform_paged_v2(
             page_size,
             metadata,
         )
+        return
+    if _use_ppu_split_topk(scores, out_page_indices, page_size, out_raw_indices):
+        # Retaining K from EVERY chunk is exact: a discarded item already has
+        # K items in its own chunk above it. No K/splits approximation is used.
+        splits = (scores.shape[1] + 16383) // 16384
+        shape = (scores.shape[0], splits * 2048)
+        indices = torch.empty(shape, dtype=torch.int32, device=scores.device)
+        values = torch.empty(shape, dtype=torch.float32, device=scores.device)
+        lengths = torch.empty_like(seq_lens)
+        module = _jit_ppu_split_topk_module()
+        module.partial(scores, seq_lens, indices, values, lengths, splits)
+        module.merge(values, lengths, indices, page_tables, out_page_indices)
         return
     module = _jit_topk_v2_module()
     module.topk_transform_paged(

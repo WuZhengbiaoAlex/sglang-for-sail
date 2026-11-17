@@ -181,6 +181,12 @@ struct TopKProblem {
   SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
+
+  // Value-emitting sinks reuse scores already resident in registers. The
+  // ordinary index-only sink compiles away this extra argument.
+  SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx, float) const {
+    emit(pos, raw_idx);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -221,9 +227,10 @@ struct TopKConfig {
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  template <typename Problem>
   SGL_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const Problem& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -238,7 +245,7 @@ struct TopKConfig {
 
     if (num_ties <= topk) {
       for (uint32_t t = tx; t < num_ties; t += kBlockSize) {
-        problem.emit(base + t, tie_buffer[t].idx);
+        problem.emit(base + t, tie_buffer[t].idx, tie_buffer[t].value);
       }
       for (uint32_t t = num_ties + tx; t < topk; t += kBlockSize) {
         problem.emit(base + t, base + t);
@@ -250,7 +257,7 @@ struct TopKConfig {
       const auto tie = tie_buffer[lane_id];
       const auto target = tie_buffer[warp_id];
       const auto rank = warp_sum_bool(is_greater(tie, target), mask);
-      if (lane_id == 0 && rank < topk) problem.emit(base + rank, target.idx);
+      if (lane_id == 0 && rank < topk) problem.emit(base + rank, target.idx, target.value);
     } else if (num_ties <= kWarpSize * 2) {
       // 64 x 64 topk implementation: each thread takes 2 elements
       const auto warp_id_0 = warp_id;
@@ -265,13 +272,13 @@ struct TopKConfig {
         const auto rank_0 = warp_sum_bool(is_greater(tie_0, target_0));
         const auto rank_1 = warp_sum_bool(is_greater(tie_1, target_0));
         const auto rank = rank_0 + rank_1;
-        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_0.idx);
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_0.idx, target_0.value);
       }
       if (warp_id_1 < num_ties) {
         const auto rank_0 = warp_sum_bool(is_greater(tie_0, target_1));
         const auto rank_1 = warp_sum_bool(is_greater(tie_1, target_1));
         const auto rank = rank_0 + rank_1;
-        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_1.idx);
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target_1.idx, target_1.value);
       }
     } else if (num_ties <= kWarpSize * 4) {
       // 128 x 128 topk implementation: each thread takes 4 elements and does local sort + merge
@@ -296,7 +303,7 @@ struct TopKConfig {
         for (int j = 0; j < 4; ++j) {
           rank += warp_sum_bool(is_greater(tie[j], target[i]));
         }
-        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target[i].idx);
+        if (lane_id == 0 && rank < topk) problem.emit(base + rank, target[i].idx, target[i].value);
       }
     } else if (num_ties <= kBlockSize) {
       // Common case: one candidate per thread.
@@ -311,10 +318,10 @@ struct TopKConfig {
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
-  template <uint32_t kItems>
+  template <uint32_t kItems, typename Problem>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const Problem& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -539,8 +546,8 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename Problem>
+  SGL_DEVICE static void forward(const Problem& problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -611,7 +618,7 @@ struct TopKRegister : TopKRadixBase<12> {
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {
-            problem.emit(pos, idx);
+            problem.emit(pos, idx, val);
           }
         } else if (val >= v_lo) {
           const auto pos = atomicAdd(&smem->count_eq, 1);
@@ -640,8 +647,8 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename Problem>
+  SGL_DEVICE static void forward(Problem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -685,7 +692,7 @@ struct TopKStreaming : TopKRadixBase<12> {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {
-          problem.emit(pos, idx);
+          problem.emit(pos, idx, val);
         }
       } else if (val >= v_lo) {
         const auto pos = atomicAdd(&smem->count_eq, 1);
@@ -752,8 +759,8 @@ struct TopKCluster : TopKRadixBase<10> {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
   }
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename Problem>
+  SGL_DEVICE static void forward(Problem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cooperative_groups::this_cluster();
@@ -868,7 +875,7 @@ struct TopKCluster : TopKRadixBase<10> {
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {
-            problem.emit(pos, idx);
+            problem.emit(pos, idx, val);
           }
         } else if (val >= v_lo) {
           const auto pos = atomicAdd(&smem->count_eq, 1);
