@@ -2018,6 +2018,8 @@ class Envs:
     # Split grouped FP8 VERIFY indexer requests over attention TP, then gather
     # logical TopK positions. Opt-in; unsupported geometries retain the old path.
     SGLANG_PPU_DSA_VERIFY_TP_SHARD = EnvBool(False)
+    # Keep VERIFY residuals sharded between MegaMoE layers on PPU.
+    SGLANG_PPU_K31_SP_ATTN_RES = EnvBool(False)
     # The PPU BF16 TopK kernel accepts a zero page-table row stride. Reuse a
     # single request's mapping instead of materializing it for every query.
     SGLANG_PPU_DSA_TOPK_BROADCAST_PAGE_TABLE = EnvBool(True)
