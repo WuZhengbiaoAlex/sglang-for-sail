@@ -65,6 +65,21 @@ def map_logical_topk_to_physical(
     if logical_indices.device != expanded_page_table.device:
         raise ValueError("TopK positions and page tables must be on the same device")
 
+    if (
+        logical_indices.is_cuda
+        and expanded_page_table.shape[1] * page_size <= 2147483647
+    ):
+        from sglang.srt.utils import is_ppu
+
+        if is_ppu():
+            from sglang.srt.layers.attention.dsa.ppu_topk_map import (
+                map_logical_topk_to_physical_triton,
+            )
+
+            return map_logical_topk_to_physical_triton(
+                logical_indices, expanded_page_table, page_size
+            )
+
     valid = (logical_indices >= 0) & (
         logical_indices < expanded_page_table.shape[1] * page_size
     )
