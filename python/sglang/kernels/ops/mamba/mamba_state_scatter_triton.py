@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.srt.utils import is_ppu
 
 
 def _require_entry_contiguous_dst(
@@ -297,8 +298,15 @@ def fused_mamba_state_scatter_with_mask(
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
 
-    # Block size for copying elements
     BLOCK_SIZE = 1024
+    if (
+        (total_requests, num_layers, elem_per_entry) == (32, 69, 196608)
+        and src.dtype == dst.dtype == torch.bfloat16
+        and is_ppu()
+    ):
+        # Each CTA copies more elements, reducing repeated index checks
+        # for the large BF16 verify workload.
+        BLOCK_SIZE = 8192
 
     # Grid over all requests - invalid ones will early-exit in the kernel
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
