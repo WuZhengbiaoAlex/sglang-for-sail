@@ -3238,15 +3238,31 @@ class KimiK3LinearModel(nn.Module):
             )
             residual = None
 
-        # Carry the raw residual stream as a token shard across consecutive
-        # SP-MoE layers. PP transfer and dspark capture require full tensors,
-        # so those uncommon paths keep the established gather-per-layer flow.
+        attn_tp_size = get_parallel().attn_tp_size
+        # Keep the raw residual stream sharded between SP-MoE layers.
+        # PPU VERIFY gathers auxiliary taps separately for speculative decode.
         sp_attn_res = (
             attn_res is not None
-            and envs.SGLANG_K3_SP_ATTN_RES.get()
             and self.pp_group.world_size == 1
-            and self.dspark_layers_to_capture is None
-            and k3_sp_collective.enabled()
+            and (
+                (
+                    envs.SGLANG_K3_SP_ATTN_RES.get()
+                    and self.dspark_layers_to_capture is None
+                    and k3_sp_collective.enabled()
+                )
+                or (
+                    envs.SGLANG_PPU_K31_SP_ATTN_RES.get()
+                    and is_ppu()
+                    and forward_batch.forward_mode.is_target_verify()
+                    and self.dspark_layers_to_capture is not None
+                    and get_moe_a2a_backend().is_megamoe()
+                    and self.config.moe_layer_freq == 1
+                    and get_parallel().attn_cp_size == 1
+                    and attn_tp_size > 1
+                    and hidden_states.shape[0] > 0
+                    and hidden_states.shape[0] % attn_tp_size == 0
+                )
+            )
         )
         sp_sharded = False
         aux_hidden_states = []
@@ -3282,9 +3298,13 @@ class KimiK3LinearModel(nn.Module):
                 and i in self.dspark_layers_to_capture
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                rows = _sp_local_rows(hidden_states) if sp_sharded else None
+                aux = self._dspark_capture_stream(
+                    i, hidden_states, residual, attn_res, rows=rows
                 )
+                if rows is not None:
+                    aux = _sp_all_gather_rows(aux)
+                aux_hidden_states.append(aux)
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3350,6 +3370,7 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         attn_res: Optional[AttnResidual],
+        rows: Optional[slice] = None,
     ) -> torch.Tensor:
         """Stream value after `layer_idx`: the pre-norm mixture its next
         consumer would compute (next layer's attention side; output side
@@ -3369,9 +3390,10 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
-            hidden_states, attn_res.block_residual, nvb, score_proj, score_norm
-        )
+        bank = attn_res.block_residual
+        if rows is not None:
+            bank = bank[rows]
+        return aggregate_stream(hidden_states, bank, nvb, score_proj, score_norm)
 
 
 class KimiK3LinearForCausalLM(nn.Module):
