@@ -106,6 +106,42 @@ class DFlashFlashMLABackend(TritonAttnBackend):
                 "DFlash BF16 FlashMLA requires the unsharded draft MLA KV pool."
             )
 
+        self._window_indices_by_geometry: dict[
+            tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        self._window_indices_by_geometry.clear()
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        # Warmup and capture share metadata buffers. Record the index builder
+        # in the graph itself so every replay reads the current physical slots.
+        self._window_indices_by_geometry.clear()
+
+    def _get_window_indices(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        block_size: int,
+        window_left: int,
+        num_query_rows: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (block_size, window_left, num_query_rows)
+        result = self._window_indices_by_geometry.get(key)
+        if result is None:
+            result = build_dflash_causal_window_indices(
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                forward_batch.out_cache_loc,
+                block_size=block_size,
+                window_left=window_left,
+                num_query_rows=num_query_rows,
+            )
+            self._window_indices_by_geometry[key] = result
+        return result
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -205,10 +241,8 @@ class DFlashFlashMLABackend(TritonAttnBackend):
                 "DFlash BF16 FlashMLA requires a BF16 [slots, 1, 576] pool."
             )
         block_size = self._target_verify_num_tokens_per_req(forward_batch.spec_info)
-        indices, topk_length = build_dflash_causal_window_indices(
-            self.forward_metadata.kv_indptr,
-            self.forward_metadata.kv_indices,
-            forward_batch.out_cache_loc,
+        indices, topk_length = self._get_window_indices(
+            forward_batch,
             block_size=block_size,
             window_left=layer.sliding_window_size,
             num_query_rows=q.shape[0],

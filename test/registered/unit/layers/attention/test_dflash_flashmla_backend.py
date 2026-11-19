@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.dflash_flashmla_backend import (
     DFlashFlashMLABackend,
     build_dflash_causal_window_indices,
 )
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -117,6 +118,67 @@ class TestDFlashFlashMLAIndices(CustomTestCase):
         self.assertEqual(ptrs, [tensor.data_ptr() for tensor in inputs])
         self.assertFalse(torch.equal(before, after))
 
+    def test_window_reuse_respects_geometry_and_forward_lifetime(self):
+        backend = DFlashFlashMLABackend.__new__(DFlashFlashMLABackend)
+        backend._window_indices_by_geometry = {}
+        indptr, prefix, current = self.make_inputs([0, 3])
+        backend.forward_metadata = SimpleNamespace(kv_indptr=indptr, kv_indices=prefix)
+        batch = SimpleNamespace(out_cache_loc=current)
+
+        def get(window_left=4, rows=11, block=5):
+            return backend._get_window_indices(
+                batch,
+                block_size=block,
+                window_left=window_left,
+                num_query_rows=rows,
+            )
+
+        # Pretend the superclass has populated the same input buffers each time.
+        with patch.object(
+            TritonAttnBackend, "init_forward_metadata", return_value=None
+        ) as initialize:
+            backend.init_forward_metadata(batch)
+            initialize.assert_called_once_with(batch)
+            first, counts = get()
+            for window, rows, block in ((2, 11, 5), (4, 9, 5), (4, 11, 3)):
+                with self.subTest(window=window, rows=rows, block=block):
+                    indices, lengths = get(window, rows, block)
+                    expected = self.check_reference(
+                        (indptr, prefix, current),
+                        window_left=window,
+                        rows=rows,
+                        block_size=block,
+                    )
+                    torch.testing.assert_close(indices, expected[0])
+                    torch.testing.assert_close(lengths, expected[1])
+
+            # Reuse the batch object and all source storage, but move the page
+            # addresses and change the prefix split. Both lengths and slots change.
+            indptr[1] = 2
+            prefix.add_(37)
+            current.add_(41)
+            backend.init_forward_metadata(batch)
+            second, second_counts = get()
+            self.assertFalse(torch.equal(first, second))
+            self.assertFalse(torch.equal(counts, second_counts))
+            expected = self.check_reference(
+                (indptr, prefix, current), window_left=4, rows=11
+            )
+            torch.testing.assert_close(second, expected[0])
+            torch.testing.assert_close(second_counts, expected[1])
+
+        # Warmup and graph capture reuse the metadata instance and static views.
+        # Each invocation must record its own producer before its layer consumers.
+        for _ in range(2):
+            prefix.add_(1)
+            backend.init_forward_metadata_in_graph(batch)
+            indices, lengths = get()
+            expected = self.check_reference(
+                (indptr, prefix, current), window_left=4, rows=11
+            )
+            torch.testing.assert_close(indices, expected[0])
+            torch.testing.assert_close(lengths, expected[1])
+
     def test_invalid_static_dimensions_fail(self):
         inputs = self.make_inputs([1])
         for block_size, window_left, rows in ((0, 1023, 5), (5, -1, 5), (5, 1, -1)):
@@ -149,6 +211,7 @@ class TestDFlashFlashMLAForward(CustomTestCase):
 
     def test_split_rope_kv_write_head_padding_and_allmasked_output(self):
         backend = DFlashFlashMLABackend.__new__(DFlashFlashMLABackend)
+        backend._window_indices_by_geometry = {}
         backend.target_verify_num_tokens_per_req = 5
         backend.forward_metadata = SimpleNamespace(
             kv_indptr=torch.tensor([0, 0], dtype=torch.int32),
@@ -204,10 +267,27 @@ class TestDFlashFlashMLAForward(CustomTestCase):
         module_path = "sglang.srt.hardware_backend.ppu.attention.flash_mla"
         module = ModuleType(module_path)
         module.flash_mla_sparse_fwd = Mock(side_effect=native)
-        with patch.dict("sys.modules", {module_path: module}):
+        backend.init_forward_metadata_in_graph(batch)
+        build_path = (
+            "sglang.srt.layers.attention.dflash_flashmla_backend."
+            "build_dflash_causal_window_indices"
+        )
+        with (
+            patch.dict("sys.modules", {module_path: module}),
+            patch(build_path, wraps=build_dflash_causal_window_indices) as build,
+        ):
             output = backend.forward_extend(
                 q, k, k, layer, batch, q_rope=q_rope, k_rope=k_rope
             )
+            first_indices = captured["indices"]
+            first_lengths = captured["topk_length"]
+            for layer_id in range(1, 5):
+                layer.layer_id = layer_id
+                backend.forward_extend(q, None, None, layer, batch, q_rope=q_rope)
+                self.assertIs(captured["indices"], first_indices)
+                self.assertIs(captured["topk_length"], first_lengths)
+            self.assertEqual(module.flash_mla_sparse_fwd.call_count, 5)
+            build.assert_called_once()
 
         self.assertIs(output, batch._attn_output)
         self.assertEqual(len(writes), 1)
@@ -222,7 +302,6 @@ class TestDFlashFlashMLAForward(CustomTestCase):
         self.assertEqual(captured["indices"][4, 0, :5].tolist(), [3, 6, 9, 12, 15])
         self.assertTrue(torch.all(output[:5] == 6))
         self.assertTrue(torch.all(output[5:] == 0))
-        module.flash_mla_sparse_fwd.assert_called_once()
 
 
 if __name__ == "__main__":
