@@ -2585,6 +2585,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
+            self._gate_overlap_verify_160 = (
+                is_ppu()
+                and self.use_dsa
+                and envs.SGLANG_PPU_K31_MLA_GATE_VERIFY_160_OVERLAP.get()
+            )
+            self._gate_overlap_verify_160_late = (
+                self._gate_overlap_verify_160
+                and envs.SGLANG_PPU_K31_MLA_GATE_VERIFY_160_LATE.get()
+            )
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
@@ -2626,15 +2635,25 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
-    def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
+    def _fork_output_gate(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
+        rows = hidden_states.shape[0]
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
             # Keep the fork and join within one capture segment.
             and not is_in_breakable_cuda_graph()
-            and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
+            and (
+                0 < rows <= self._gate_bs_limit
+                or (
+                    self._gate_overlap_verify_160
+                    and rows == 160
+                    and forward_batch.forward_mode.is_target_verify()
+                )
+            )
         ):
             alt = self._gate_alt_stream
             alt.wait_stream(torch.cuda.current_stream())
@@ -2660,7 +2679,22 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
-            self._fork_output_gate(hidden_states)
+            if (
+                self._gate_overlap_verify_160_late
+                and hidden_states.shape[0] == 160
+                and forward_batch.forward_mode.is_target_verify()
+                and self._gate_alt_stream is not None
+                and get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
+            ):
+                # Capture the fork after QKV and the indexer, just before MLA.
+                self._gate_pending_stream = None
+                state = self.forward_prepare(
+                    positions, hidden_states, forward_batch, zero_allocator, **kwargs
+                )
+                self._fork_output_gate(hidden_states, forward_batch)
+                return self.forward_core(state)
+            self._fork_output_gate(hidden_states, forward_batch)
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )

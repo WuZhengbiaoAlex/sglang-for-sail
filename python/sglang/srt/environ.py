@@ -1407,6 +1407,10 @@ class Envs:
     SGLANG_K3_KDA_INPUT_PROJ_FUSION = EnvBool(True)
     # Fuse KDA gated RMSNorm and per-token E4M3 quantization for the PPU O projection.
     SGLANG_PPU_KDA_GATE_NORM_FP8 = EnvBool(False)
+    # Overlap the K3.1 MLA output gate with attention for 160-row PPU VERIFY graphs.
+    SGLANG_PPU_K31_MLA_GATE_VERIFY_160_OVERLAP = EnvBool(False)
+    # With gate overlap enabled, fork after the QKV and DSA indexer work.
+    SGLANG_PPU_K31_MLA_GATE_VERIFY_160_LATE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
