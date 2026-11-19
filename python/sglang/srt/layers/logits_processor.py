@@ -67,6 +67,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
     is_pin_memory_available,
+    is_ppu,
     use_intel_amx_backend,
 )
 
@@ -283,6 +284,10 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # DFlash VERIFY completes its target sampling after replay. The same captured
+    # graph can serve greedy and sampled requests by returning the local LM shard.
+    dflash_local_logits: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -485,6 +490,17 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        self._defer_dflash_logits = (
+            envs.SGLANG_PPU_DFLASH_VERIFY_SHARDED_GREEDY.get()
+            and is_ppu()
+            # K3.1 directly returns our output. Other models can postprocess
+            # full logits after this call (e.g. mask out reserved token IDs).
+            and getattr(config, "architectures", None) == ["KimiK31LinearForCausalLM"]
+            and self.use_attn_tp_group
+            and self.do_tensor_parallel_all_gather
+            and not self.final_logit_softcapping
+            and not return_full_logits
+        )
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -522,7 +538,16 @@ class LogitsProcessor(nn.Module):
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         token_indices_to_pool = None
+        defer_dflash_logits = False
         if isinstance(logits_metadata, ForwardBatch):
+            defer_dflash_logits = (
+                logits_metadata.forward_mode.is_target_verify()
+                and self._defer_dflash_logits
+                and getattr(logits_metadata.spec_info, "defer_attn_tp_logits", False)
+                and isinstance(lm_head, VocabParallelEmbedding)
+                and lm_head.tp_size == self.attn_tp_size
+                and lm_head.num_embeddings == lm_head.org_vocab_size == self.vocab_size
+            )
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             token_indices_to_pool = logits_metadata.token_indices_to_pool
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
@@ -597,6 +622,16 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
+            if defer_dflash_logits:
+                local_logits = self._get_logits(
+                    pruned_states, lm_head, logits_metadata, return_local_vocab=True
+                )
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    dflash_local_logits=local_logits,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
@@ -900,6 +935,8 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        *,
+        return_local_vocab: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -956,6 +993,10 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
         if SGLANG_PROFILE_NVTX:
             th_nvtx_range_pop()
+
+        if return_local_vocab:
+            # Logit scaling above is part of the original argmax input.
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:

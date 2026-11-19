@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.vocab_parallel_top1 import vocab_parallel_top1
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -219,6 +220,31 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _can_use_sharded_greedy(batch: ScheduleBatch, selector_sample) -> bool:
+    if (
+        batch.return_logprob
+        or batch.has_grammar
+        or batch.beam_tail is not None
+        or selector_sample is not None
+    ):
+        return False
+    info = batch.sampling_info
+    if info is None:
+        return True
+    return (
+        info.is_all_greedy
+        and not info.has_custom_logit_processor
+        and info.grammar_mask is None
+        and info.logit_bias is None
+        and info.acc_additive_penalties is None
+        and info.acc_scaling_penalties is None
+        and getattr(info, "acc_linear_penalties", None) is None
+        and not (info.penalizer_orchestrator and info.penalizer_orchestrator.is_required)
+        and info.sampling_mask_batch_indices is None
+        and info.sampling_support_logprobs_capture_indices is None
+    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -2147,18 +2173,49 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _resolve_verify_vocab_output(
+        self, batch, logits_output, lm_head, *, can_run_cuda_graph: bool
+    ) -> Optional[torch.Tensor]:
+        local_logits = logits_output.dflash_local_logits
+        if local_logits is None:
+            return None
+        # Graph replay returns a fresh output wrapper around captured buffers.
+        logits_output.dflash_local_logits = None
+        group = get_parallel().attn_tp_group
+        if _can_use_sharded_greedy(batch, self._selector_sample):
+            shard = lm_head.shard_indices
+            return vocab_parallel_top1(
+                local_logits,
+                vocab_start=shard.org_vocab_start_index,
+                valid_columns=shard.num_org_elements,
+                group=group,
+            )
+
+        # Restore the original full-vocabulary sampling input on this DP rank.
+        # Only contiguous original-vocabulary shards can reach this method.
+        vocab_size = lm_head.org_vocab_size
+        gathered = group.all_gather(local_logits, dim=-1)[:, :vocab_size]
+        if can_run_cuda_graph:
+            buffer = self.model_runner.graph_shared_output.get_logits_buffer(
+                vocab_size, rows=local_logits.shape[0]
+            )
+            logits_output.next_token_logits = buffer.copy_(gathered)
+        else:
+            logits_output.next_token_logits = gathered.float()
+        return None
+
     def _accept_block(
         self,
         *,
         candidates: torch.Tensor,
-        next_token_logits: torch.Tensor,
+        next_token_logits: Optional[torch.Tensor],
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        target_predict: Optional[torch.Tensor] = None,
     ):
         new_seq_lens = None
-        target_predict = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2186,9 +2243,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
@@ -2768,6 +2825,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         verify_input_ids = draft_tokens.reshape(-1)
         verify_input = DFlashVerifyInput(
+            defer_attn_tp_logits=True,
             draft_token=verify_input_ids,
             positions=positions,
             draft_token_num=int(self.block_size),
@@ -2811,6 +2869,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        target_predict = self._resolve_verify_vocab_output(
+            batch, logits_output, lm_head, can_run_cuda_graph=can_run_cuda_graph
+        )
+
         grammar_mask = None
         if batch.has_grammar:
             grammar_mask = build_grammar_vocab_mask(
@@ -2821,7 +2883,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and target_predict is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -2843,6 +2905,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
+            target_predict=target_predict,
             sampling_info=sampling_info,
             draft_input=draft_input,
             prefix_lens=prefix_lens,

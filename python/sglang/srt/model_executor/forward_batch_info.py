@@ -1989,6 +1989,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.num_tokens_per_req
+                if logits_output.dflash_local_logits is not None:
+                    logits_output.dflash_local_logits = logits_output.dflash_local_logits[
+                        :num_tokens
+                    ]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens

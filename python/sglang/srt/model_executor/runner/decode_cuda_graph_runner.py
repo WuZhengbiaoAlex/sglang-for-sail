@@ -1611,6 +1611,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return dataclasses.replace(
                 output,
                 next_token_logits=next_token_logits,
+                dflash_local_logits=(
+                    output.dflash_local_logits[: self.raw_num_token]
+                    if output.dflash_local_logits is not None
+                    else None
+                ),
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
@@ -1697,6 +1702,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else CaptureHiddenMode.FULL
                 ),
                 ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+                defer_attn_tp_logits=(
+                    self.model_runner.spec_algorithm.is_dflash()
+                    and not self.model_runner.is_draft_worker
+                ),
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

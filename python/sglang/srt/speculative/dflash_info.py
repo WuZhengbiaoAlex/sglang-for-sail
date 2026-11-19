@@ -51,6 +51,8 @@ class DFlashVerifyInput(SpecInput):
     live_seq_lens_cpu: Optional[torch.Tensor] = None
     # Conservative request-lifetime bound for candidate graph dispatch.
     candidate_max_seq_len_upper_bound: Optional[int] = None
+    # Only the DFlash v2 target worker consumes local LM-head shard outputs.
+    defer_attn_tp_logits: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

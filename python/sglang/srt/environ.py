@@ -1411,6 +1411,8 @@ class Envs:
     SGLANG_PPU_K31_MLA_GATE_VERIFY_160_OVERLAP = EnvBool(False)
     # With gate overlap enabled, fork after the QKV and DSA indexer work.
     SGLANG_PPU_K31_MLA_GATE_VERIFY_160_LATE = EnvBool(False)
+    # Select greedy DFlash target tokens across attention-TP vocabulary shards.
+    SGLANG_PPU_DFLASH_VERIFY_SHARDED_GREEDY = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
