@@ -2473,9 +2473,6 @@ class DeepseekSparseAttnBackend(
                 ),
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-
             # _forward_flashmla_sparse owns padding for both prefill and
             # decode, including K3.1's non-power-of-two local head counts.
 
@@ -2547,8 +2544,12 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
-            if q_rope is not None:
+            if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            elif torch.compiler.is_compiling() or q_all.data_ptr() % 16:
+                # Contiguous offset views may violate FlashMLA's 16-byte alignment.
+                # While tracing, clone without inspecting the input pointer.
+                q_all = q_all.clone()
             if _is_ppu:
                 if dsa_impl == "flashmla_sparse_q8":
                     return self._forward_ppu_flashmla_sparse_q8(

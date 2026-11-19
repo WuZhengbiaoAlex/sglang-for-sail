@@ -642,6 +642,7 @@ class TestPPUGroupedVerifyMetadata(CustomTestCase):
                 indexer = SimpleNamespace(
                     use_fp4=False,
                     bf16_indexer=False,
+                    use_bf16_paged_logits=False,
                     sm_count=39,
                     index_topk=4,
                     paged_mqa_logits_backend=SimpleNamespace(
