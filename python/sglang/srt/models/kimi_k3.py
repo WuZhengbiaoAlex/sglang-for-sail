@@ -136,6 +136,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_platform,
 )
@@ -1915,6 +1916,16 @@ class KimiK3DeltaAttention(nn.Module):
             self.all_reduce_fusion = False
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = not self._cp_tp_group
+        self._use_kda_gate_norm_fp8 = (
+            is_ppu()
+            and envs.SGLANG_PPU_KDA_GATE_NORM_FP8.get()
+            and self.local_num_heads == 12
+            and self.head_dim == 128
+            # The symmetric output and GEMM NVTX paths consume a BF16 Tensor.
+            and not self.all_reduce_fusion
+            and not envs.SGLANG_PROFILE_NVTX.get()
+            and not k3_sp_collective.enabled()
+        )
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2371,6 +2382,36 @@ class KimiK3DeltaAttention(nn.Module):
             self.attn._k3_deferred_f_b = False
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            if (
+                self._use_kda_gate_norm_fp8
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_decode()
+                )
+                and not cp_active
+                and not get_forward().sp_active
+                and getattr(self.o_proj, "_ppu_w8a8_fp8_enabled", False)
+                and getattr(
+                    self.o_proj.quant_method, "accepts_prequantized_input", False
+                )
+                and core_attn_out.dtype == norm_gate.dtype == torch.bfloat16
+                and self.o_norm.weight.dtype in (torch.bfloat16, torch.float32)
+                and norm_gate.shape[1:] == (12, 128)
+                and core_attn_out.shape == (1, *norm_gate.shape)
+                and norm_gate.shape[0] > 0
+                and self.o_norm.weight.is_contiguous()
+            ):
+                from sglang.kernels.ops.attention.fla.kda_gate_norm_fp8 import (
+                    kda_gate_norm_fp8,
+                )
+
+                quantized = kda_gate_norm_fp8(
+                    core_attn_out.squeeze(0),
+                    norm_gate,
+                    self.o_norm.weight,
+                    self.o_norm.eps,
+                )
+                return self.o_proj(quantized)[0]
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         if cp_active:

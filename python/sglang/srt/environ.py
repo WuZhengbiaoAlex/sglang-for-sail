@@ -1405,6 +1405,8 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Fuse full-rank K3 KDA input projections on PPU. Default on.
     SGLANG_K3_KDA_INPUT_PROJ_FUSION = EnvBool(True)
+    # Fuse KDA gated RMSNorm and per-token E4M3 quantization for the PPU O projection.
+    SGLANG_PPU_KDA_GATE_NORM_FP8 = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
