@@ -2027,6 +2027,8 @@ class Envs:
     # Split grouped FP8 VERIFY indexer requests over attention TP, then gather
     # logical TopK positions. Opt-in; unsupported geometries retain the old path.
     SGLANG_PPU_DSA_VERIFY_TP_SHARD = EnvBool(False)
+    # Project only this TP rank's VERIFY indexer queries and head weights.
+    SGLANG_PPU_DSA_VERIFY_LOCAL_PROJ = EnvBool(False)
     # Fuse K3.1 main VERIFY dense FP8 o_proj with its SP-MoE TP8 RS.
     SGLANG_PPU_K31_FUSE_O_PROJ_RS = EnvBool(False)
     # Keep VERIFY residuals sharded between MegaMoE layers on PPU.

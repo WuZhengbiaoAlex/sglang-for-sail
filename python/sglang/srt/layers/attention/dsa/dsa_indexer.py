@@ -613,6 +613,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"index_head_dim={self.head_dim} must be divisible by MXFP4 block {MXFP_BLOCK_SIZE.value}"
             )
 
+        # Q and K may use different row counts only when their shared RoPE
+        # and fused K/weight projection are absent, as in Kimi K3.1.
+        self.use_verify_local_proj = (
+            envs.SGLANG_PPU_DSA_VERIFY_LOCAL_PROJ.get()
+            and is_ppu()
+            and _is_kimi_k31_indexer_config(config)
+            and self.use_fp8
+            and self.rotary_emb is None
+            and not self.use_dsa_indexer_fusion
+        )
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -1355,6 +1366,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _get_verify_projection_shard(
+        self, forward_batch: ForwardBatch, metadata: Optional[BaseIndexerMetadata], x
+    ) -> Optional[IndexerRequestShardMetadata]:
+        shard = getattr(metadata, "indexer_request_shard", None)
+        if (
+            shard is not None
+            and self.use_verify_local_proj
+            and forward_batch.forward_mode.is_target_verify()
+            and isinstance(x, torch.Tensor)
+            and forward_batch.attn_cp_metadata is None
+            and not getattr(self.wq_b, "set_lora", False)
+            and not getattr(self.weights_proj, "set_lora", False)
+        ):
+            return shard
+        return None
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1362,6 +1389,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_fp8: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        *,
+        full_query_rows: Optional[int] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1542,10 +1571,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 weights,
                 block_tables,
                 request_shard,
+                full_query_rows=full_query_rows,
                 paged_mqa_logits=paged_mqa_logits,
                 max_seq_len=max_seq_len,
                 page_size=page_size,
             )
+
+        assert full_query_rows is None, "local Q projections require a request shard"
 
         # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
         def _chunked_fp8_paged_mqa_logits(
@@ -1721,31 +1753,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         block_tables: torch.Tensor,
         shard: IndexerRequestShardMetadata,
         *,
+        full_query_rows: Optional[int] = None,
         paged_mqa_logits: Callable[..., torch.Tensor],
         max_seq_len: int,
         page_size: int = 64,
     ) -> torch.Tensor:
         """Serial request-sharded VERIFY indexer; return full-batch physical slots.
 
-        Projections and index-K writes have already run for the complete batch.
-        Only grouped MQA/TopK are partitioned. All ranks, including empty padded
-        shards, gather logical token positions on the current stream, then map
-        them through their own page tables. No physical addresses cross ranks.
+        Index-K writes cover the complete batch. If Q and head weights were
+        projected locally, full_query_rows records the original padded extent.
+        All ranks, including padding-only shards, gather logical positions
+        on the current stream, then map them through their own page tables.
         """
         group = get_parallel().attn_tp_group
         assert group.world_size == shard.tp_size
         assert group.rank_in_group == shard.tp_rank
         q_offset = shard.full_batch_size * shard.next_n
-        assert q_fp8.shape[0] >= q_offset
-        assert weights.shape[0] >= q_offset
-        assert block_tables.shape[0] >= q_offset
         start, end = shard.query_start, shard.query_end
+        if full_query_rows is None:
+            full_query_rows = q_fp8.shape[0]
+            assert weights.shape[0] >= q_offset
+            q_fp8, weights = q_fp8[start:end], weights[start:end]
+        assert full_query_rows >= q_offset and block_tables.shape[0] >= q_offset
+        assert q_fp8.shape[0] == weights.shape[0] == end - start
         local_lengths = shard.ctx_lens_2d.reshape(-1)
         logits = deepgemm_paged_mqa_logits_native(
             paged_mqa_logits,
-            q_fp8[start:end],
+            q_fp8,
             kv_cache_fp8,
-            weights[start:end],
+            weights,
             shard.ctx_lens_2d,
             block_tables[start:end],
             shard.schedule_metadata,
@@ -1775,12 +1811,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         # DP padding of hidden states can exceed the metadata's request bucket.
         # Keep the existing full-query output contract for downstream attention.
-        if q_fp8.shape[0] > q_offset:
+        if full_query_rows > q_offset:
             topk_result = torch.cat(
                 [
                     topk_result,
                     topk_result.new_full(
-                        (q_fp8.shape[0] - q_offset, self.index_topk), -1
+                        (full_query_rows - q_offset, self.index_topk), -1
                     ),
                 ],
                 dim=0,
@@ -2679,6 +2715,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.weights_proj, "set_lora", False
         )
 
+        full_query_rows = None
         if (
             self._aiter_fused_fp8_active(forward_batch)
             and not in_piecewise_or_breakable_cuda_graph
@@ -2763,6 +2800,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
+            gate_input = x
+            projection_shard = (
+                self._get_verify_projection_shard(forward_batch, metadata, x)
+                if self.use_verify_local_proj
+                else None
+            )
+            if projection_shard is not None:
+                # Store every index-K locally. Only this rank's requests need Q
+                # and head weights for its grouped logits and logical TopK.
+                full_query_rows = q_lora.shape[0]
+                rows = slice(projection_shard.query_start, projection_shard.query_end)
+                q_lora = q_lora[rows]
+                gate_input = x[rows]
+                if get_is_capture_mode():
+                    print_info_once(
+                        "PPU K31 VERIFY local indexer projections: "
+                        f"Q/weights={q_lora.shape[0]} rows, K={x.shape[0]} rows"
+                    )
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora,
                 x,
@@ -2868,7 +2923,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 else:
                     x_for_gate = x_q.to(torch.bfloat16)
             else:
-                x_for_gate = x
+                x_for_gate = gate_input
 
             if in_piecewise_or_breakable_cuda_graph:
                 if self.use_fp4:
@@ -2964,7 +3019,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    weights,
+                    metadata,
+                    full_query_rows=full_query_rows,
                 )
             else:
                 if (

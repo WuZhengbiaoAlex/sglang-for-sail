@@ -1,7 +1,8 @@
 """Static request partitions for the replicated PPU verification indexer.
 
 The metadata belongs to one attention backend and one graph bucket. Its tensors
-are refreshed in place before replay; projection/cache writes remain replicated.
+are refreshed in place before replay. Index-K projection and cache writes cover
+all queries. Q and head weights may be projected only for this rank's requests.
 """
 
 from __future__ import annotations

@@ -379,7 +379,10 @@ class TestIndexerRequestSharding(CustomTestCase):
             paged_mqa_logits,
             max_seq_len,
             page_size,
+            full_query_rows=None,
         ):
+            self.assertEqual(full_query_rows, rows if presharded else None)
+            self.assertEqual(q.shape[0], shard.query_end if presharded else rows)
             self.assertIs(actual_shard, shard)
             self.assertIs(actual_pages, pages)
             scores = paged_mqa_logits(q, kv, weights)
@@ -406,18 +409,21 @@ class TestIndexerRequestSharding(CustomTestCase):
             ),
             patch.object(indexer, "_get_topk_paged_tp_sharded", side_effect=sharded),
         ):
-            for enabled in (False, True):
-                indexer.use_bf16_paged_logits = enabled
-                out = indexer._get_topk_paged(
-                    SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
-                    0,
-                    torch.zeros((rows, 32, 128)),
-                    torch.ones((rows, 32, 1)),
-                    metadata,
-                )
-                torch.testing.assert_close(
-                    out, torch.full((rows, 3), int(enabled), dtype=torch.int32)
-                )
+            for presharded in (False, True):
+                nq = shard.query_end if presharded else rows
+                for enabled in (False, True):
+                    indexer.use_bf16_paged_logits = enabled
+                    out = indexer._get_topk_paged(
+                        SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                        0,
+                        torch.zeros((nq, 32, 128)),
+                        torch.ones((nq, 32, 1)),
+                        metadata,
+                        full_query_rows=rows if presharded else None,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.full((rows, 3), int(enabled), dtype=torch.int32)
+                    )
 
     def test_ppu_precomputed_hook_passes_padding_and_restores_metadata_on_error(self):
         from sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks import (
