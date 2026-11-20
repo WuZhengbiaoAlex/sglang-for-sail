@@ -1799,6 +1799,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
+        local_feature_group=None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1824,11 +1825,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise ValueError(
                 f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
             )
-        num_tokens = int(target_hidden.shape[0])
+        expected_tokens = int(cache_loc.numel())
+        # For local features, the projector gathers the whole padded bucket
+        # before trimming. Slicing each shard to a live count would reorder it.
+        num_tokens = (
+            int(target_hidden.shape[0])
+            if local_feature_group is None
+            else expected_tokens
+        )
         # Drop trailing alignment-padding rows (from TP/EP-size rounding)
         # before materializing into the draft KV; they would corrupt other
         # requests' cache slots.
-        expected_tokens = int(cache_loc.numel())
         if num_tokens > expected_tokens:
             if not getattr(self, "_logged_padding_trim", False):
                 logger.warning(
@@ -1897,7 +1904,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 owns_attention=self.draft_owns_attention,
             ),
         ):
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if local_feature_group is None:
+                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            else:
+                ctx_hidden = self.draft_model.project_sharded_target_hidden(
+                    target_hidden, group=local_feature_group, num_tokens=num_tokens
+                )
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2965,15 +2977,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
-        hidden = logits_output.hidden_states
+        hidden = logits_output.dflash_local_target_features
+        local_feature_group = None
         if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
-            )
-        hidden = hidden.view(bs, int(self.block_size), -1)
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.reshape(bs * int(self.block_size), -1)
+        else:
+            # Capture the target TP group before entering the draft TP context.
+            local_feature_group = get_parallel().attn_tp_group
 
         self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            target_hidden=hidden,
+            local_feature_group=local_feature_group,
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
@@ -2982,6 +3001,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+        logits_output.dflash_local_target_features = None
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,

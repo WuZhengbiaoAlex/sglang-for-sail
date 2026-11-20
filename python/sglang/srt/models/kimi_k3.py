@@ -11,6 +11,7 @@ import os
 import re
 from array import array
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -3185,6 +3186,11 @@ class KimiK3DecoderLayer(nn.Module):
         return out, None, False
 
 
+@dataclass
+class _LocalDFlashTargetFeatures:
+    values: torch.Tensor
+
+
 class KimiK3LinearModel(nn.Module):
     """K3 language-model backbone."""
 
@@ -3198,6 +3204,11 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self._local_dflash_features_enabled = (
+            envs.SGLANG_PPU_DFLASH_LOCAL_FEATURE_PROJ.get()
+            and is_ppu()
+            and getattr(config, "architectures", None) == ["KimiK31LinearForCausalLM"]
+        )
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync()
 
@@ -3339,6 +3350,23 @@ class KimiK3LinearModel(nn.Module):
                 )
             )
         )
+        keep_local_features = (
+            self._local_dflash_features_enabled
+            and sp_attn_res
+            and attn_tp_size == 8
+            # On PPU, the replicated BF16 FC uses the same rounding for
+            # M=160 and M=20. Other row counts can select a different GEMM.
+            and hidden_states.shape[0] == 160
+            and hidden_states.dtype == torch.bfloat16
+            and self.dspark_layers_to_capture is not None
+            and len(self.dspark_layers_to_capture) == 6
+            and forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch.spec_info, "defer_attn_tp_logits", False)
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_dflash()
+            and forward_batch.spec_info.ragged_verify_layout is None
+            and forward_batch.capture_hidden_mode.is_full()
+        )
         sp_sharded = False
         aux_hidden_states = []
         if (
@@ -3377,8 +3405,19 @@ class KimiK3LinearModel(nn.Module):
                 aux = self._dspark_capture_stream(
                     i, hidden_states, residual, attn_res, rows=rows
                 )
+                if keep_local_features and rows is None:
+                    # A mixed full/sharded layout falls back to full taps.
+                    aux_hidden_states = [
+                        _sp_all_gather_rows(h) for h in aux_hidden_states
+                    ]
+                    keep_local_features = False
                 if rows is not None:
-                    aux = _sp_all_gather_rows(aux)
+                    if not keep_local_features:
+                        aux = _sp_all_gather_rows(aux)
+                    elif aux is hidden_states:
+                        # With zero prior residual blocks the tap borrows the
+                        # current layer's prefix instead of allocating a snapshot.
+                        aux = aux.clone()
                 aux_hidden_states.append(aux)
 
         if not self.pp_group.is_last_rank:
@@ -3435,6 +3474,11 @@ class KimiK3LinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if keep_local_features:
+            # Traversal order matches the full-tap path. Only the row axis is sharded.
+            return hidden_states, _LocalDFlashTargetFeatures(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -3588,13 +3632,18 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            return self.logits_processor(
+            local_features = isinstance(aux_hidden_states, _LocalDFlashTargetFeatures)
+            output = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
-                aux_hidden_states,
+                None if local_features else aux_hidden_states,
             )
+            if local_features:
+                output.hidden_states = None
+                output.dflash_local_target_features = aux_hidden_states.values
+            return output
         return hidden_states
 
     def _forward_cp(

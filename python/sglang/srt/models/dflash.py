@@ -934,6 +934,28 @@ class DFlashDraftModel(nn.Module):
             projected = projected[0]
         return self.hidden_norm(projected)
 
+    def project_sharded_target_hidden(
+        self, local_features: torch.Tensor, *, group, num_tokens: int
+    ) -> torch.Tensor:
+        """Project rank-local rows, reassemble the target's row order, then trim graph padding."""
+        padded_rows = local_features.shape[0] * group.world_size
+        if not 0 <= num_tokens <= padded_rows:
+            raise ValueError(
+                f"DFlash needs {num_tokens} target rows, but TP shards contain {padded_rows}"
+            )
+        # A partially filled graph originally applied FC at the live M. The
+        # PPU GEMM can round differently at another M; restore the raw features
+        # before projecting in that case.
+        full_bucket = num_tokens == padded_rows
+        local = (
+            self.project_target_hidden(local_features) if full_bucket else local_features
+        ).contiguous()
+        full = local.new_empty((padded_rows, local.shape[-1]))
+        group.all_gather_into_tensor(full, local)
+        if full_bucket:
+            return full
+        return self.project_target_hidden(full[:num_tokens])
+
     @torch.no_grad()
     def forward(
         self,

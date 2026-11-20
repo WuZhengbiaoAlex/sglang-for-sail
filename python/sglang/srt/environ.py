@@ -1413,6 +1413,7 @@ class Envs:
     SGLANG_PPU_K31_MLA_GATE_VERIFY_160_LATE = EnvBool(False)
     # Select greedy DFlash target tokens across attention-TP vocabulary shards.
     SGLANG_PPU_DFLASH_VERIFY_SHARDED_GREEDY = EnvBool(False)
+    SGLANG_PPU_DFLASH_LOCAL_FEATURE_PROJ = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

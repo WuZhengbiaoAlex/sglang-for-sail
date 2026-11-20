@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as graph_mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -81,6 +82,37 @@ class TestDFlashDPLocalGraph(CustomTestCase):
     def tearDown(self):
         reset_context()
         super().tearDown()
+
+    def test_target_replay_preserves_padded_local_feature_shards(self):
+        runner = _runner(draft=False)
+        runner.model_runner.device_timer = None
+        runner.is_dllm = False
+        runner._replay_graph_key = mock.sentinel.graph_key
+        runner._incremental_eplb_puller = None
+        runner.backend.replay_session = nullcontext
+        runner._replay_attn_backend.return_value.shared_read_ends = mock.Mock(
+            return_value=graph_mod.SharedReadEnds.UNKNOWN
+        )
+        runner.load_batch = mock.Mock()
+        local = torch.arange(20 * 6).view(20, 6)
+        captured = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(160, 4),
+            dflash_local_target_features=local,
+        )
+        runner.backend.replay = mock.Mock(return_value=captured)
+        # Each TP peer must contribute its full 20 rows even when a different
+        # DP group determined the graph bucket. Trimming happens after gather.
+        for bs in (1, 31):
+            batch = _batch(bs)
+            runner.raw_num_token = bs * 5
+            result = runner.execute(batch)
+            batch.post_forward_mlp_sync_batch(result)
+            self.assertIsNot(result, captured)
+            self.assertEqual(result.next_token_logits.shape[0], bs * 5)
+            self.assertIs(result.dflash_local_target_features, local)
+            result.dflash_local_target_features = None
+            self.assertIs(captured.dflash_local_target_features, local)
+            self.assertEqual(captured.next_token_logits.shape[0], 160)
 
     def test_draft_requires_scheduler_vote_without_global_counts(self):
         runner, batch = _runner(), _batch()

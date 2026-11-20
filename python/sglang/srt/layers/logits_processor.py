@@ -288,6 +288,10 @@ class LogitsProcessorOutput:
     # graph can serve greedy and sampled requests by returning the local LM shard.
     dflash_local_logits: Optional[torch.Tensor] = None
 
+    # Ranks own contiguous rows of the *padded* VERIFY bucket. Replay must
+    # preserve each whole shard; the draft worker trims after the TP gather.
+    dflash_local_target_features: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
